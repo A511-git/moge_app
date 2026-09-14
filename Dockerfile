@@ -25,7 +25,6 @@ RUN uv pip install \
     --index-url https://download.pytorch.org/whl/cu128 \
     && uv pip install \
     --python /opt/venv/bin/python \
-    --extra-index-url https://download.pytorch.org/whl/cu128 \
     -r /tmp/requirements.txt
 
 
