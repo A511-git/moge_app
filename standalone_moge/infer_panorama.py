@@ -12,6 +12,7 @@ if _parent_dir not in sys.path:
 
 import json
 import itertools
+import time
 from typing import Optional
 
 import cv2
@@ -139,197 +140,369 @@ def main(
     print(f"[MoGe CLI] Loading MoGe-3 ({model_key.upper()} - {model_params}) from '{pretrained_model_name_or_path}' on {device} (fp16={use_fp16})...")
     model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
 
-    print(f"[MoGe CLI] Processing {len(image_paths)} image(s)...")
+    print(f"[MoGe CLI] Processing {len(image_paths)} image(s) for 5 runs...")
+    for run_idx in range(5):
+        print(f"\n[MoGe CLI] --- Starting Run {run_idx + 1}/5 ---")
 
-    for image_path in tqdm(image_paths, desc="Total Panoramas", disable=len(image_paths) <= 1):
-        image_bgr = cv2.imread(str(image_path))
-        if image_bgr is None:
-            print(f"[WARNING] Skipping unreadable image: {image_path}")
-            continue
+        for image_path in tqdm(image_paths, desc=f"Total Panoramas (Run {run_idx+1})", disable=len(image_paths) <= 1):
+            run_start_time = time.time()
+            image_bgr = cv2.imread(str(image_path))
 
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        orig_height, orig_width = image_rgb.shape[:2]
-        image = image_rgb.copy()
+            if image_bgr is None:
 
-        # Handle optional resize
-        target_height, target_width = orig_height, orig_width
-        if resize_to is not None and (orig_height > resize_to or orig_width > resize_to):
-            target_height = min(resize_to, int(resize_to * orig_height / orig_width))
-            target_width = min(resize_to, int(resize_to * orig_width / orig_height))
-            image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+                print(f"[WARNING] Skipping unreadable image: {image_path}")
 
-        # Output folder per image
-        if input_p.is_dir():
-            rel_parent = image_path.relative_to(input_p).parent
-            save_path = Path(output_path, rel_parent, image_path.stem)
-        else:
-            save_path = Path(output_path, image_path.stem)
-        save_path.mkdir(exist_ok=True, parents=True)
+                continue
 
-        # 1. Split equirectangular panorama into perspective views
-        splitted_extrinsics, splitted_intrinsics = get_panorama_cameras()
-        splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intrinsics, split_resolution)
 
-        # 2. Infer views
-        splitted_distance_maps, splitted_masks = [], []
-        if save_debug:
-            splitted_depth_maps, splitted_points_maps, splitted_normal_maps = [], [], []
+            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-        for i in trange(0, len(splitted_images), batch_size, desc="Inferring views", leave=False, disable=len(splitted_images) <= batch_size):
-            batch_slice = splitted_images[i:i + batch_size]
-            image_tensor = torch.tensor(
-                np.stack(batch_slice) / 255.0,
-                dtype=torch.float32,
-                device=device
-            ).permute(0, 3, 1, 2)
+            orig_height, orig_width = image_rgb.shape[:2]
 
-            fov_x, _ = np.rad2deg(utils3d.np.intrinsics_to_fov(np.array(splitted_intrinsics[i:i + batch_size])))
-            fov_x_tensor = torch.tensor(fov_x, dtype=torch.float32, device=device)
+            image = image_rgb.copy()
 
-            infer_kwargs = {
-                'fov_x': fov_x_tensor,
-                'resolution_level': resolution_level,
-                'apply_mask': False,
-                'refine_steps': refine_steps,
-                'use_fp16': use_fp16,
-            }
-            if num_tokens is not None:
-                infer_kwargs['num_tokens'] = num_tokens
 
-            with torch.no_grad():
-                output = model.infer(image_tensor, **infer_kwargs)
+            # Handle optional resize
 
-            distance_map = output['points'].norm(dim=-1).cpu().numpy()
-            mask = output['mask'].cpu().numpy()
-            splitted_distance_maps.extend(list(distance_map))
-            splitted_masks.extend(list(mask))
+            target_height, target_width = orig_height, orig_width
+
+            if resize_to is not None and (orig_height > resize_to or orig_width > resize_to):
+
+                target_height = min(resize_to, int(resize_to * orig_height / orig_width))
+
+                target_width = min(resize_to, int(resize_to * orig_width / orig_height))
+
+                image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+
+            # Output folder per image
+
+            if input_p.is_dir():
+
+                rel_parent = image_path.relative_to(input_p).parent
+
+                save_path = Path(output_path, rel_parent, image_path.stem)
+
+            else:
+
+                save_path = Path(output_path, image_path.stem)
+
+            save_path.mkdir(exist_ok=True, parents=True)
+
+
+            t0 = time.time()
+            # 1. Split equirectangular panorama into perspective views
+
+            splitted_extrinsics, splitted_intrinsics = get_panorama_cameras()
+
+            splitted_images = split_panorama_image(image, splitted_extrinsics, splitted_intrinsics, split_resolution)
+
+
+            t1 = time.time()
+            print(f"[Timing] Split panorama: {t1 - t0:.3f}s")
+            # 2. Infer views
+
+            splitted_distance_maps, splitted_masks = [], []
 
             if save_debug:
-                splitted_depth_maps.extend(list(output['depth'].cpu().numpy()))
-                splitted_points_maps.extend(list(output['points'].cpu().numpy()))
-                if 'normal' in output and output['normal'] is not None:
-                    splitted_normal_maps.extend(list(output['normal'].cpu().numpy()))
 
-        # Save splitted views if requested in debug mode
-        if save_debug:
-            splitted_dir = save_path / 'splitted'
-            splitted_dir.mkdir(exist_ok=True, parents=True)
-            cameras_meta = []
-            for i in range(len(splitted_images)):
-                cv2.imwrite(str(splitted_dir / f'{i:02d}.jpg'), cv2.cvtColor(splitted_images[i], cv2.COLOR_RGB2BGR))
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_mask.png'), (splitted_masks[i] * 255).astype(np.uint8))
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_depth.exr'), splitted_depth_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_depth_vis.png'), cv2.cvtColor(colorize_depth(splitted_depth_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_distance.exr'), splitted_distance_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
-                cv2.imwrite(str(splitted_dir / f'{i:02d}_points.exr'), splitted_points_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-                if len(splitted_normal_maps) > i:
-                    cv2.imwrite(str(splitted_dir / f'{i:02d}_normal.png'), cv2.cvtColor(colorize_normal(splitted_normal_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+                splitted_depth_maps, splitted_points_maps, splitted_normal_maps = [], [], []
 
-                fov_xi, fov_yi = np.rad2deg(utils3d.np.intrinsics_to_fov(splitted_intrinsics[i]))
-                cam_info = {
-                    'index': i,
-                    'image': f'{i:02d}.jpg',
-                    'fov_x': round(float(fov_xi), 2),
-                    'fov_y': round(float(fov_yi), 2),
-                    'intrinsics': splitted_intrinsics[i].tolist(),
-                    'extrinsics': splitted_extrinsics[i].tolist(),
+
+            for i in trange(0, len(splitted_images), batch_size, desc="Inferring views", leave=False, disable=len(splitted_images) <= batch_size):
+
+                batch_slice = splitted_images[i:i + batch_size]
+
+                image_tensor = torch.tensor(
+
+                    np.stack(batch_slice) / 255.0,
+
+                    dtype=torch.float32,
+
+                    device=device
+
+                ).permute(0, 3, 1, 2)
+
+
+                fov_x, _ = np.rad2deg(utils3d.np.intrinsics_to_fov(np.array(splitted_intrinsics[i:i + batch_size])))
+
+                fov_x_tensor = torch.tensor(fov_x, dtype=torch.float32, device=device)
+
+
+                infer_kwargs = {
+
+                    'fov_x': fov_x_tensor,
+
+                    'resolution_level': resolution_level,
+
+                    'apply_mask': False,
+
+                    'refine_steps': refine_steps,
+
+                    'use_fp16': use_fp16,
+
                 }
-                cameras_meta.append(cam_info)
-                with open(splitted_dir / f'{i:02d}_camera.json', 'w') as f:
-                    json.dump(cam_info, f, indent=2)
 
-            with open(splitted_dir / 'cameras.json', 'w') as f:
-                json.dump({'views': cameras_meta}, f, indent=2)
+                if num_tokens is not None:
 
-        # 3. Merge panoramic depth using sparse linear solver
-        merging_width, merging_height = min(1920, target_width), min(960, target_height)
-        panorama_depth, panorama_mask = merge_panorama_depth(
-            merging_width,
-            merging_height,
-            splitted_distance_maps,
-            splitted_masks,
-            splitted_extrinsics,
-            splitted_intrinsics
-        )
-        panorama_depth = panorama_depth.astype(np.float32)
+                    infer_kwargs['num_tokens'] = num_tokens
 
-        # 4. Upscale back to EXACT original input image dimensions
-        if panorama_depth.shape[:2] != (target_height, target_width):
-            panorama_depth = cv2.resize(panorama_depth, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-            panorama_mask = cv2.resize(panorama_mask.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_NEAREST) > 0
 
-        # Compute 3D coordinate points only if requested for points.npy or visual maps
-        points = None
-        if save_points_npy or save_maps_:
-            uv = utils3d.np.uv_map(target_height, target_width)
-            directions = spherical_uv_to_directions(uv)
-            points = panorama_depth[:, :, None] * directions
+                with torch.no_grad():
 
-        # Track generated file paths
-        npy_files = {}
-        map_files = {}
-        debug_files = {}
+                    output = model.infer(image_tensor, **infer_kwargs)
 
-        # Write primary depth.npy
-        if save_depth_npy:
-            depth_npy_p = save_path / 'depth.npy'
-            np.save(str(depth_npy_p), panorama_depth)
-            npy_files['depth.npy'] = str(depth_npy_p.resolve())
 
-        if save_points_npy:
-            points_npy_p = save_path / 'points.npy'
-            np.save(str(points_npy_p), points)
-            npy_files['points.npy'] = str(points_npy_p.resolve())
+                distance_map = output['points'].norm(dim=-1).cpu().numpy()
 
-        # Write optional visual maps
-        if save_maps_:
-            normals, normals_mask = utils3d.np.point_map_to_normal_map(points, panorama_mask)
+                mask = output['mask'].cpu().numpy()
 
-            img_p = save_path / 'image.jpg'
-            cv2.imwrite(str(img_p), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-            map_files['image.jpg'] = str(img_p.resolve())
+                splitted_distance_maps.extend(list(distance_map))
 
-            dvis_p = save_path / 'depth_vis.png'
-            cv2.imwrite(str(dvis_p), cv2.cvtColor(colorize_depth(panorama_depth, mask=panorama_mask), cv2.COLOR_RGB2BGR))
-            map_files['depth_vis.png'] = str(dvis_p.resolve())
+                splitted_masks.extend(list(mask))
 
-            nvis_p = save_path / 'normal_vis.png'
-            cv2.imwrite(str(nvis_p), cv2.cvtColor(colorize_normal(normals, mask=normals_mask), cv2.COLOR_RGB2BGR))
-            map_files['normal_vis.png'] = str(nvis_p.resolve())
 
-            dexr_p = save_path / 'depth.exr'
-            cv2.imwrite(str(dexr_p), panorama_depth, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-            map_files['depth.exr'] = str(dexr_p.resolve())
+                if save_debug:
 
-            pexr_p = save_path / 'points.exr'
-            cv2.imwrite(str(pexr_p), points, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-            map_files['points.exr'] = str(pexr_p.resolve())
+                    splitted_depth_maps.extend(list(output['depth'].cpu().numpy()))
 
-            mask_p = save_path / 'mask.png'
-            cv2.imwrite(str(mask_p), (panorama_mask * 255).astype(np.uint8))
-            map_files['mask.png'] = str(mask_p.resolve())
+                    splitted_points_maps.extend(list(output['points'].cpu().numpy()))
 
-        if save_debug:
-            debug_files['debug_folder'] = str((save_path / 'splitted').resolve())
+                    if 'normal' in output and output['normal'] is not None:
 
-        # Print detailed generated file paths in CLI
-        print("\n" + "=" * 65)
-        print(f"📦 Artifacts Generated for: {image_path.name}")
-        print("=" * 65)
-        if npy_files:
-            print("NPY Files:")
-            for k, v in npy_files.items():
-                print(f"  • {k:<18} : {v}")
-        if map_files:
-            print("\nMaps Files:")
-            for k, v in map_files.items():
-                print(f"  • {k:<18} : {v}")
-        if debug_files:
-            print("\nDebug Files (Splitted Views):")
-            for k, v in debug_files.items():
-                print(f"  • {k:<18} : {v}")
-        print("=" * 65)
+                        splitted_normal_maps.extend(list(output['normal'].cpu().numpy()))
+
+
+            # Save splitted views if requested in debug mode
+
+            if save_debug:
+
+                splitted_dir = save_path / 'splitted'
+
+                splitted_dir.mkdir(exist_ok=True, parents=True)
+
+                cameras_meta = []
+
+                for i in range(len(splitted_images)):
+
+                    cv2.imwrite(str(splitted_dir / f'{i:02d}.jpg'), cv2.cvtColor(splitted_images[i], cv2.COLOR_RGB2BGR))
+
+                    cv2.imwrite(str(splitted_dir / f'{i:02d}_mask.png'), (splitted_masks[i] * 255).astype(np.uint8))
+
+                    cv2.imwrite(str(splitted_dir / f'{i:02d}_depth.exr'), splitted_depth_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+
+                    cv2.imwrite(str(splitted_dir / f'{i:02d}_depth_vis.png'), cv2.cvtColor(colorize_depth(splitted_depth_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+
+                    cv2.imwrite(str(splitted_dir / f'{i:02d}_distance.exr'), splitted_distance_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+
+                    cv2.imwrite(str(splitted_dir / f'{i:02d}_distance_vis.png'), cv2.cvtColor(colorize_depth(splitted_distance_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+
+                    cv2.imwrite(str(splitted_dir / f'{i:02d}_points.exr'), splitted_points_maps[i], [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+
+                    if len(splitted_normal_maps) > i:
+
+                        cv2.imwrite(str(splitted_dir / f'{i:02d}_normal.png'), cv2.cvtColor(colorize_normal(splitted_normal_maps[i], splitted_masks[i]), cv2.COLOR_RGB2BGR))
+
+
+                    fov_xi, fov_yi = np.rad2deg(utils3d.np.intrinsics_to_fov(splitted_intrinsics[i]))
+
+                    cam_info = {
+
+                        'index': i,
+
+                        'image': f'{i:02d}.jpg',
+
+                        'fov_x': round(float(fov_xi), 2),
+
+                        'fov_y': round(float(fov_yi), 2),
+
+                        'intrinsics': splitted_intrinsics[i].tolist(),
+
+                        'extrinsics': splitted_extrinsics[i].tolist(),
+
+                    }
+
+                    cameras_meta.append(cam_info)
+
+                    with open(splitted_dir / f'{i:02d}_camera.json', 'w') as f:
+
+                        json.dump(cam_info, f, indent=2)
+
+
+                with open(splitted_dir / 'cameras.json', 'w') as f:
+
+                    json.dump({'views': cameras_meta}, f, indent=2)
+
+
+            t2 = time.time()
+            print(f"[Timing] Infer views: {t2 - t1:.3f}s")
+            # 3. Merge panoramic depth using sparse linear solver
+
+            merging_width, merging_height = min(1920, target_width), min(960, target_height)
+
+            panorama_depth, panorama_mask = merge_panorama_depth(
+
+                merging_width,
+
+                merging_height,
+
+                splitted_distance_maps,
+
+                splitted_masks,
+
+                splitted_extrinsics,
+
+                splitted_intrinsics
+
+            )
+
+            panorama_depth = panorama_depth.astype(np.float32)
+
+
+            t3 = time.time()
+            print(f"[Timing] Merge panorama: {t3 - t2:.3f}s")
+            # 4. Upscale back to EXACT original input image dimensions
+
+            if panorama_depth.shape[:2] != (target_height, target_width):
+
+                panorama_depth = cv2.resize(panorama_depth, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+
+                panorama_mask = cv2.resize(panorama_mask.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_NEAREST) > 0
+
+
+            # Compute 3D coordinate points only if requested for points.npy or visual maps
+
+            points = None
+
+            if save_points_npy or save_maps_:
+
+                uv = utils3d.np.uv_map(target_height, target_width)
+
+                directions = spherical_uv_to_directions(uv)
+
+                points = panorama_depth[:, :, None] * directions
+
+
+            # Track generated file paths
+
+            npy_files = {}
+
+            map_files = {}
+
+            debug_files = {}
+
+
+            # Write primary depth.npy
+
+            if save_depth_npy:
+
+                depth_npy_p = save_path / 'depth.npy'
+
+                np.save(str(depth_npy_p), panorama_depth)
+
+                npy_files['depth.npy'] = str(depth_npy_p.resolve())
+
+
+            if save_points_npy:
+
+                points_npy_p = save_path / 'points.npy'
+
+                np.save(str(points_npy_p), points)
+
+                npy_files['points.npy'] = str(points_npy_p.resolve())
+
+
+            # Write optional visual maps
+
+            if save_maps_:
+
+                normals, normals_mask = utils3d.np.point_map_to_normal_map(points, panorama_mask)
+
+
+                img_p = save_path / 'image.jpg'
+
+                cv2.imwrite(str(img_p), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+
+                map_files['image.jpg'] = str(img_p.resolve())
+
+
+                dvis_p = save_path / 'depth_vis.png'
+
+                cv2.imwrite(str(dvis_p), cv2.cvtColor(colorize_depth(panorama_depth, mask=panorama_mask), cv2.COLOR_RGB2BGR))
+
+                map_files['depth_vis.png'] = str(dvis_p.resolve())
+
+
+                nvis_p = save_path / 'normal_vis.png'
+
+                cv2.imwrite(str(nvis_p), cv2.cvtColor(colorize_normal(normals, mask=normals_mask), cv2.COLOR_RGB2BGR))
+
+                map_files['normal_vis.png'] = str(nvis_p.resolve())
+
+
+                dexr_p = save_path / 'depth.exr'
+
+                cv2.imwrite(str(dexr_p), panorama_depth, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+
+                map_files['depth.exr'] = str(dexr_p.resolve())
+
+
+                pexr_p = save_path / 'points.exr'
+
+                cv2.imwrite(str(pexr_p), points, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+
+                map_files['points.exr'] = str(pexr_p.resolve())
+
+
+                mask_p = save_path / 'mask.png'
+
+                cv2.imwrite(str(mask_p), (panorama_mask * 255).astype(np.uint8))
+
+                map_files['mask.png'] = str(mask_p.resolve())
+
+
+            if save_debug:
+
+                debug_files['debug_folder'] = str((save_path / 'splitted').resolve())
+
+
+            t4 = time.time()
+            print(f"[Timing] Upscale & Postprocess: {t4 - t3:.3f}s")
+            print(f"[Timing] TOTAL Image Processing: {t4 - run_start_time:.3f}s")
+            # Print detailed generated file paths in CLI
+
+            print("\n" + "=" * 65)
+
+            print(f"📦 Artifacts Generated for: {image_path.name}")
+
+            print("=" * 65)
+
+            if npy_files:
+
+                print("NPY Files:")
+
+                for k, v in npy_files.items():
+
+                    print(f"  • {k:<18} : {v}")
+
+            if map_files:
+
+                print("\nMaps Files:")
+
+                for k, v in map_files.items():
+
+                    print(f"  • {k:<18} : {v}")
+
+            if debug_files:
+
+                print("\nDebug Files (Splitted Views):")
+
+                for k, v in debug_files.items():
+
+                    print(f"  • {k:<18} : {v}")
+
+            print("=" * 65)
+
 
     print(f"\n[MoGe CLI] Inference finished successfully! Output saved to: {output_path}")
 
