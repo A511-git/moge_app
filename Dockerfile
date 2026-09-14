@@ -37,6 +37,7 @@ ENV OPENCV_IO_ENABLE_OPENEXR=1
 ENV PATH="/opt/venv/bin:$PATH"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
