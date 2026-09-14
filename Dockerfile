@@ -22,9 +22,10 @@ COPY requirements.txt /tmp/requirements.txt
 RUN uv pip install \
     --python /opt/venv/bin/python \
     torch torchvision \
-    --index-url https://download.pytorch.org/whl/cu121 \
+    --index-url https://download.pytorch.org/whl/cu128 \
     && uv pip install \
     --python /opt/venv/bin/python \
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
     -r /tmp/requirements.txt
 
 

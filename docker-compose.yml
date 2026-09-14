@@ -3,27 +3,28 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: moge-3-panorama-cli:latest
+    image: moge-panorama-cli:latest
     container_name: moge_panorama_cli
     environment:
       - CHECKPOINT_DIR=/checkpoints
       - MOGE_OUTPUT=/data/outputs
       - MOGE_MODEL=vitl            # 'vitl' (370M parameters) or 'vitg' (1.25B parameters)
-      - MOGE_DEVICE=cpu           # 'cuda', 'cuda:0', 'cpu'
-      - MOGE_RESOLUTION_LEVEL=0    # [0-9] (Default: 9)
-      - MOGE_REFINE_STEPS=0        # Sparse 3D refinement steps (Default: 3)
+      - MOGE_DEVICE=cuda           # 'cuda', 'cuda:0', 'cpu'
+      - MOGE_RESOLUTION_LEVEL=9    # [0-9] (Default: 9)
+      - MOGE_REFINE_STEPS=3        # Sparse 3D refinement steps (Default: 3)
       - MOGE_SPLIT_RESOLUTION=512  # Perspective view resolution (Default: 512)
       - MOGE_BATCH_SIZE=1          # Inference batch size (Default: 4)
-      - MOGE_MAPS=false             # Generate depth_vis, normal_vis, exr maps
+      - MOGE_MAPS=false            # Generate depth_vis, normal_vis, exr maps
       - MOGE_DEPTH_NPY=true        # Save depth.npy array
       - MOGE_POINTS_NPY=false      # Save points.npy 3D coordinates array
     volumes:
       - ./checkpoints:/checkpoints
       - ./data:/data
-    # deploy:                      # <-- Commented out / removed
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    command: ["-i", "/data/seema_sign.jpeg", "-o", "/data/outputs"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["-i", "/data/input.jpg", "-o", "/data/outputs"]
