@@ -339,23 +339,15 @@ def main(
             # 3. Merge panoramic depth using sparse linear solver
 
             merging_width, merging_height = min(1920, target_width), min(960, target_height)
-
             panorama_depth, panorama_mask = merge_panorama_depth(
-
                 merging_width,
-
                 merging_height,
-
                 splitted_distance_maps,
-
                 splitted_masks,
-
                 splitted_extrinsics,
-
-                splitted_intrinsics
-
+                splitted_intrinsics,
+                device=device
             )
-
             panorama_depth = panorama_depth.astype(np.float32)
 
 
