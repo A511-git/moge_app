@@ -41,7 +41,8 @@ try:
         split_panorama_image,
         merge_panorama_depth,
         save_gaussian_splat_ply,
-        depth_to_spherical_gaussians
+        depth_to_spherical_gaussians,
+        depth_to_spherical_gaussians_torch
     )
     from standalone_moge.utils.download_weights import download_single, normalize_model_name, MODELS
 except ImportError:
@@ -53,7 +54,8 @@ except ImportError:
         split_panorama_image,
         merge_panorama_depth,
         save_gaussian_splat_ply,
-        depth_to_spherical_gaussians
+        depth_to_spherical_gaussians,
+        depth_to_spherical_gaussians_torch
     )
     from .utils.download_weights import download_single, normalize_model_name, MODELS
 
@@ -486,7 +488,8 @@ def main(
                     global_scale=ply_scale,
                     disc_thickness=ply_thickness,
                     min_depth=ply_min_depth,
-                    max_depth=ply_max_depth
+                    max_depth=ply_max_depth,
+                    device=device
                 )
                 splat_p = save_path / 'splat.ply'
                 save_gaussian_splat_ply(str(splat_p), pts, cols, scs, qts)

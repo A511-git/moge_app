@@ -427,17 +427,30 @@ def merge_panorama_depth(
 
 def save_gaussian_splat_ply(
     filepath: Union[str, Path],
-    points: np.ndarray,
-    colors: np.ndarray,
-    scales: np.ndarray,
-    quats: np.ndarray,
-    opacities: Optional[np.ndarray] = None
+    points: Union[np.ndarray, torch.Tensor],
+    colors: Union[np.ndarray, torch.Tensor],
+    scales: Union[np.ndarray, torch.Tensor],
+    quats: Union[np.ndarray, torch.Tensor],
+    opacities: Optional[Union[np.ndarray, torch.Tensor]] = None
 ):
     """
     Exports points as standard 3D Gaussian Splatting binary PLY format.
     Compatible with SuperSplat, PlayCanvas, Luma AI, and WebGL 3DGS Viewers.
+    Supports both NumPy arrays and PyTorch CUDA tensors.
     """
     filepath = Path(filepath)
+
+    if isinstance(points, torch.Tensor):
+        points = points.detach().cpu().numpy()
+    if isinstance(colors, torch.Tensor):
+        colors = colors.detach().cpu().numpy()
+    if isinstance(scales, torch.Tensor):
+        scales = scales.detach().cpu().numpy()
+    if isinstance(quats, torch.Tensor):
+        quats = quats.detach().cpu().numpy()
+    if opacities is not None and isinstance(opacities, torch.Tensor):
+        opacities = opacities.detach().cpu().numpy()
+
     N = len(points)
     if N == 0:
         print(f"⚠️ No points to save for {filepath}")
@@ -505,19 +518,154 @@ end_header
         f.write(elements.tobytes())
 
 
-def depth_to_spherical_gaussians(
-    depth: np.ndarray,
-    rgb: np.ndarray,
-    mask: Optional[np.ndarray] = None,
+def depth_to_spherical_gaussians_torch(
+    depth: Union[torch.Tensor, np.ndarray],
+    rgb: Union[torch.Tensor, np.ndarray],
+    mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
     stride: int = 1,
     is_indoor: bool = True,
     global_scale: float = 1.2,
     disc_thickness: float = 0.2,
     min_depth: float = 0.1,
-    max_depth: Optional[float] = None
+    max_depth: Optional[float] = None,
+    device: Optional[Union[str, torch.device]] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    100% GPU-Accelerated conversion of spherical equirectangular depth and RGB panorama into 3D Gaussian Splats.
+    Executes millions of trigonometric, scaling, rotation, and quaternion calculations in parallel on CUDA cores.
+    
+    Args:
+        depth: [H, W] float32 radial depth/distance map.
+        rgb: [H, W, 3] RGB image (uint8 or float).
+        mask: Optional [H, W] bool valid prediction mask.
+        stride: Pixel subsampling stride (1=full resolution).
+        is_indoor: True for indoor preset (default cutoff 15m), False for outdoor (default cutoff 80m).
+        global_scale: Splat radius scale multiplier.
+        disc_thickness: Disc thickness ratio relative to min(s1, s2).
+        min_depth: Minimum distance threshold in meters.
+        max_depth: Maximum distance cutoff in meters (defaults: 15.0m indoor, 80.0m outdoor).
+        device: Target device (defaults to depth.device if torch.Tensor, else cuda if available).
+
+    Returns:
+        (flat_points, flat_rgb, flat_scales, flat_quats) as torch.Tensors
+    """
+    if device is None:
+        if isinstance(depth, torch.Tensor):
+            device = depth.device
+        else:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    if not isinstance(depth, torch.Tensor):
+        depth_t = torch.as_tensor(depth, dtype=torch.float32, device=device)
+    else:
+        depth_t = depth.to(device=device, dtype=torch.float32)
+
+    if not isinstance(rgb, torch.Tensor):
+        rgb_t = torch.as_tensor(rgb, device=device)
+    else:
+        rgb_t = rgb.to(device=device)
+
+    if mask is not None:
+        if not isinstance(mask, torch.Tensor):
+            mask_t = torch.as_tensor(mask, dtype=torch.bool, device=device)
+        else:
+            mask_t = mask.to(device=device, dtype=torch.bool)
+    else:
+        mask_t = None
+
+    if max_depth is None:
+        max_depth = 15.0 if is_indoor else 80.0
+
+    H, W = depth_t.shape[:2]
+    if rgb_t.shape[:2] != (H, W):
+        orig_dtype = rgb_t.dtype
+        rgb_f = rgb_t.permute(2, 0, 1).unsqueeze(0).float()
+        rgb_resized = F.interpolate(rgb_f, size=(H, W), mode='area')
+        rgb_t = rgb_resized.squeeze(0).permute(1, 2, 0).to(orig_dtype)
+
+    if stride > 1:
+        depth_t = depth_t[::stride, ::stride]
+        rgb_t = rgb_t[::stride, ::stride]
+        if mask_t is not None:
+            mask_t = mask_t[::stride, ::stride]
+        H, W = depth_t.shape[:2]
+
+    u = (torch.arange(W, dtype=torch.float32, device=device) + 0.5) / W
+    v = (torch.arange(H, dtype=torch.float32, device=device) + 0.5) / H
+    v_grid, u_grid = torch.meshgrid(v, u, indexing='ij')
+
+    theta = (1.0 - u_grid) * (2.0 * torch.pi)
+    phi = v_grid * torch.pi
+
+    sin_phi = torch.sin(phi)
+    cos_phi = torch.cos(phi)
+    sin_theta = torch.sin(theta)
+    cos_theta = torch.cos(theta)
+
+    dx = sin_phi * cos_theta
+    dy = sin_phi * sin_theta
+    dz = cos_phi
+
+    dirs = torch.stack([dx, dy, dz], dim=-1)
+    pts = dirs * depth_t.unsqueeze(-1)
+
+    t1 = torch.stack([-sin_theta, cos_theta, torch.zeros_like(theta)], dim=-1)
+    t2 = torch.stack([cos_phi * cos_theta, cos_phi * sin_theta, -sin_phi], dim=-1)
+
+    d_theta = (2.0 * torch.pi) / W
+    d_phi = torch.pi / H
+
+    s1 = depth_t * (d_theta * torch.clamp(sin_phi, min=1e-3)) * global_scale
+    s2 = depth_t * (d_phi * global_scale)
+    s3 = disc_thickness * torch.minimum(s1, s2)
+
+    scales = torch.stack([s1, s2, s3], dim=-1)
+    log_scales = torch.log(torch.clamp(scales, min=1e-5, max=1e2))
+
+    R00, R01, R02 = t1[..., 0], t2[..., 0], dx
+    R10, R11, R12 = t1[..., 1], t2[..., 1], dy
+    R20, R21, R22 = t1[..., 2], t2[..., 2], dz
+
+    tr = R00 + R11 + R22
+    qw = torch.sqrt(torch.clamp(1.0 + tr, min=0.0)) / 2.0
+    denom = 4.0 * torch.clamp(qw, min=1e-6)
+    qx = (R21 - R12) / denom
+    qy = (R02 - R20) / denom
+    qz = (R10 - R01) / denom
+
+    quats = torch.stack([qw, qx, qy, qz], dim=-1)
+    q_norm = torch.clamp(torch.norm(quats, dim=-1, keepdim=True), min=1e-6)
+    quats = quats / q_norm
+
+    valid = torch.isfinite(depth_t) & (depth_t >= min_depth) & (depth_t <= max_depth)
+    if mask_t is not None:
+        valid = valid & mask_t
+
+    flat_pts = pts[valid]
+    flat_rgb = rgb_t[valid]
+    flat_scales = log_scales[valid]
+    flat_quats = quats[valid]
+
+    return flat_pts, flat_rgb, flat_scales, flat_quats
+
+
+def depth_to_spherical_gaussians(
+    depth: Union[np.ndarray, torch.Tensor],
+    rgb: Union[np.ndarray, torch.Tensor],
+    mask: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    stride: int = 1,
+    is_indoor: bool = True,
+    global_scale: float = 1.2,
+    disc_thickness: float = 0.2,
+    min_depth: float = 0.1,
+    max_depth: Optional[float] = None,
+    device: Optional[Union[str, torch.device]] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Converts spherical equirectangular depth and RGB panorama into 3D Gaussian Splats.
+    Accelerated via GPU PyTorch with seamless NumPy compatibility.
     
     Args:
         depth: [H, W] float32 radial depth/distance map.
@@ -529,76 +677,26 @@ def depth_to_spherical_gaussians(
         disc_thickness: Disc thickness ratio relative to min(s1, s2).
         min_depth: Minimum distance threshold in meters.
         max_depth: Maximum distance cutoff in meters (defaults: 15.0m indoor, 80.0m outdoor).
+        device: Target computation device (defaults to GPU if available).
 
     Returns:
-        (flat_points, flat_rgb, flat_scales, flat_quats)
+        (flat_points, flat_rgb, flat_scales, flat_quats) as NumPy arrays
     """
-    if max_depth is None:
-        max_depth = 15.0 if is_indoor else 80.0
-
-    H, W = depth.shape[:2]
-    if rgb.shape[:2] != (H, W):
-        rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_AREA)
-
-    if stride > 1:
-        depth = depth[::stride, ::stride]
-        rgb = rgb[::stride, ::stride]
-        if mask is not None:
-            mask = mask[::stride, ::stride]
-        H, W = depth.shape[:2]
-
-    u = np.linspace(0.5 / W, 1.0 - 0.5 / W, W, dtype=np.float32)
-    v = np.linspace(0.5 / H, 1.0 - 0.5 / H, H, dtype=np.float32)
-    u_grid, v_grid = np.meshgrid(u, v)
-
-    theta = (1.0 - u_grid) * (2.0 * np.pi)
-    phi = v_grid * np.pi
-
-    sin_phi = np.sin(phi)
-    cos_phi = np.cos(phi)
-    sin_theta = np.sin(theta)
-    cos_theta = np.cos(theta)
-
-    dx = sin_phi * cos_theta
-    dy = sin_phi * sin_theta
-    dz = cos_phi
-
-    dirs = np.stack([dx, dy, dz], axis=-1)
-    pts = (dirs * depth[..., None]).astype(np.float32)
-
-    t1 = np.stack([-sin_theta, cos_theta, np.zeros_like(theta)], axis=-1)
-    t2 = np.stack([cos_phi * cos_theta, cos_phi * sin_theta, -sin_phi], axis=-1)
-
-    d_theta = (2.0 * np.pi) / W
-    d_phi = np.pi / H
-
-    s1 = depth * (d_theta * sin_phi.clip(1e-3)) * global_scale
-    s2 = depth * d_phi * global_scale
-    s3 = disc_thickness * np.minimum(s1, s2)
-
-    log_scales = np.log(np.stack([s1, s2, s3], axis=-1).clip(1e-5, 1e2)).astype(np.float32)
-
-    R00, R01, R02 = t1[..., 0], t2[..., 0], dx
-    R10, R11, R12 = t1[..., 1], t2[..., 1], dy
-    R20, R21, R22 = t1[..., 2], t2[..., 2], dz
-
-    tr = R00 + R11 + R22
-    qw = np.sqrt(np.maximum(0.0, 1.0 + tr)) / 2.0
-    qx = (R21 - R12) / (4.0 * np.maximum(qw, 1e-6))
-    qy = (R02 - R20) / (4.0 * np.maximum(qw, 1e-6))
-    qz = (R10 - R01) / (4.0 * np.maximum(qw, 1e-6))
-
-    quats = np.stack([qw, qx, qy, qz], axis=-1).astype(np.float32)
-    q_norm = np.linalg.norm(quats, axis=-1, keepdims=True).clip(1e-6)
-    quats = quats / q_norm
-
-    valid = np.isfinite(depth) & (depth >= min_depth) & (depth <= max_depth)
-    if mask is not None:
-        valid = valid & mask
-
-    flat_pts = pts[valid].reshape(-1, 3)
-    flat_rgb = rgb[valid].reshape(-1, 3)
-    flat_scales = log_scales[valid].reshape(-1, 3)
-    flat_quats = quats[valid].reshape(-1, 4)
-
-    return flat_pts, flat_rgb, flat_scales, flat_quats
+    pts, cols, scs, qts = depth_to_spherical_gaussians_torch(
+        depth=depth,
+        rgb=rgb,
+        mask=mask,
+        stride=stride,
+        is_indoor=is_indoor,
+        global_scale=global_scale,
+        disc_thickness=disc_thickness,
+        min_depth=min_depth,
+        max_depth=max_depth,
+        device=device
+    )
+    return (
+        pts.detach().cpu().numpy(),
+        cols.detach().cpu().numpy(),
+        scs.detach().cpu().numpy(),
+        qts.detach().cpu().numpy()
+    )

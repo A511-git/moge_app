@@ -8,7 +8,8 @@ from ..utils.panorama import (
     merge_panorama_depth_gpu,
     merge_panorama_depth,
     save_gaussian_splat_ply,
-    depth_to_spherical_gaussians
+    depth_to_spherical_gaussians,
+    depth_to_spherical_gaussians_torch
 )
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "merge_panorama_depth_gpu",
     "merge_panorama_depth",
     "save_gaussian_splat_ply",
-    "depth_to_spherical_gaussians"
+    "depth_to_spherical_gaussians",
+    "depth_to_spherical_gaussians_torch"
 ]
