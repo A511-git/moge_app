@@ -39,7 +39,9 @@ try:
         spherical_uv_to_directions,
         get_panorama_cameras,
         split_panorama_image,
-        merge_panorama_depth
+        merge_panorama_depth,
+        save_gaussian_splat_ply,
+        depth_to_spherical_gaussians
     )
     from standalone_moge.utils.download_weights import download_single, normalize_model_name, MODELS
 except ImportError:
@@ -49,7 +51,9 @@ except ImportError:
         spherical_uv_to_directions,
         get_panorama_cameras,
         split_panorama_image,
-        merge_panorama_depth
+        merge_panorama_depth,
+        save_gaussian_splat_ply,
+        depth_to_spherical_gaussians
     )
     from .utils.download_weights import download_single, normalize_model_name, MODELS
 
@@ -73,6 +77,13 @@ except ImportError:
 @click.option('--maps', 'save_maps_', is_flag=True, envvar='MOGE_MAPS', help='Save visual maps and raw EXRs (depth.exr, points.exr, depth_vis.png, normal_vis.png, mask.png). [env: MOGE_MAPS]')
 @click.option('--depth_npy/--no-depth_npy', 'save_depth_npy', envvar='MOGE_DEPTH_NPY', default=True, show_default=True, help='Save primary depth.npy float32 array. [env: MOGE_DEPTH_NPY]')
 @click.option('--points_npy', 'save_points_npy', is_flag=True, envvar='MOGE_POINTS_NPY', help='Save 3D coordinates points.npy float32 array. [env: MOGE_POINTS_NPY]')
+@click.option('--ply', 'save_ply', is_flag=True, envvar='MOGE_PLY', help='Save 3D Gaussian Splatting splat.ply file. [env: MOGE_PLY]')
+@click.option('--ply_is_indoor/--no-ply_is_indoor', 'ply_is_indoor', default=True, show_default=True, envvar='MOGE_PLY_IS_INDOOR', help='Scene environment preset for PLY splat generation (indoor: max 15m depth cutoff; outdoor: max 80m depth cutoff with sky filtering). [env: MOGE_PLY_IS_INDOOR]')
+@click.option('--ply_stride', type=int, default=1, show_default=True, envvar='MOGE_PLY_STRIDE', help='Pixel sampling stride for splat generation (1=full res, 2=half res for lighter WebGL viewers). [env: MOGE_PLY_STRIDE]')
+@click.option('--ply_scale', type=float, default=1.2, show_default=True, envvar='MOGE_PLY_SCALE', help='Global splat radius scale multiplier. [env: MOGE_PLY_SCALE]')
+@click.option('--ply_thickness', type=float, default=0.2, show_default=True, envvar='MOGE_PLY_THICKNESS', help='Splat disc thickness ratio. [env: MOGE_PLY_THICKNESS]')
+@click.option('--ply_min_depth', type=float, default=0.1, show_default=True, envvar='MOGE_PLY_MIN_DEPTH', help='Minimum distance threshold in meters. [env: MOGE_PLY_MIN_DEPTH]')
+@click.option('--ply_max_depth', type=float, default=None, envvar='MOGE_PLY_MAX_DEPTH', help='Maximum distance cutoff in meters (default: 15.0m for indoor, 80.0m for outdoor). [env: MOGE_PLY_MAX_DEPTH]')
 def main(
     input_path: str,
     output_path: str,
@@ -90,7 +101,14 @@ def main(
     save_debug: bool,
     save_maps_: bool,
     save_depth_npy: bool,
-    save_points_npy: bool
+    save_points_npy: bool,
+    save_ply: bool,
+    ply_is_indoor: bool,
+    ply_stride: int,
+    ply_scale: float,
+    ply_thickness: float,
+    ply_min_depth: float,
+    ply_max_depth: Optional[float]
 ):
     """
     Executes standalone MoGe-3 panorama inference CLI on single images or entire folders.
@@ -454,9 +472,25 @@ def main(
 
 
             if save_debug:
-
                 debug_files['debug_folder'] = str((save_path / 'splitted').resolve())
 
+            # Write optional 3D Gaussian Splat
+            ply_files = {}
+            if save_ply:
+                pts, cols, scs, qts = depth_to_spherical_gaussians(
+                    panorama_depth,
+                    image,
+                    mask=panorama_mask,
+                    stride=ply_stride,
+                    is_indoor=ply_is_indoor,
+                    global_scale=ply_scale,
+                    disc_thickness=ply_thickness,
+                    min_depth=ply_min_depth,
+                    max_depth=ply_max_depth
+                )
+                splat_p = save_path / 'splat.ply'
+                save_gaussian_splat_ply(str(splat_p), pts, cols, scs, qts)
+                ply_files['splat.ply'] = str(splat_p.resolve())
 
             t4 = time.time()
             print(f"[Timing] Upscale & Postprocess: {t4 - t3:.3f}s")
@@ -478,19 +512,18 @@ def main(
                     print(f"  • {k:<18} : {v}")
 
             if map_files:
-
                 print("\nMaps Files:")
-
                 for k, v in map_files.items():
+                    print(f"  • {k:<18} : {v}")
 
+            if ply_files:
+                print("\n3D Gaussian Splat Files:")
+                for k, v in ply_files.items():
                     print(f"  • {k:<18} : {v}")
 
             if debug_files:
-
                 print("\nDebug Files (Splitted Views):")
-
                 for k, v in debug_files.items():
-
                     print(f"  • {k:<18} : {v}")
 
             print("=" * 65)

@@ -6,7 +6,9 @@ from ..utils.panorama import (
     split_panorama_image,
     solve_poisson_cg_torch,
     merge_panorama_depth_gpu,
-    merge_panorama_depth
+    merge_panorama_depth,
+    save_gaussian_splat_ply,
+    depth_to_spherical_gaussians
 )
 
 __all__ = [
@@ -17,5 +19,7 @@ __all__ = [
     "split_panorama_image",
     "solve_poisson_cg_torch",
     "merge_panorama_depth_gpu",
-    "merge_panorama_depth"
+    "merge_panorama_depth",
+    "save_gaussian_splat_ply",
+    "depth_to_spherical_gaussians"
 ]

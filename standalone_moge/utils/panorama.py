@@ -423,3 +423,182 @@ def merge_panorama_depth(
 
     x = solve_poisson_cg_torch(grad_x=t_gx, grad_y=t_gy, laplacian=t_lap, mask_x=t_mx, mask_y=t_my, mask_lap=t_mlap, max_iter=120, tol=1e-5, device=device).detach().cpu().numpy()
     return np.exp(x).astype(np.float32), np.any(panorama_pred_masks, axis=0)
+
+
+def save_gaussian_splat_ply(
+    filepath: Union[str, Path],
+    points: np.ndarray,
+    colors: np.ndarray,
+    scales: np.ndarray,
+    quats: np.ndarray,
+    opacities: Optional[np.ndarray] = None
+):
+    """
+    Exports points as standard 3D Gaussian Splatting binary PLY format.
+    Compatible with SuperSplat, PlayCanvas, Luma AI, and WebGL 3DGS Viewers.
+    """
+    filepath = Path(filepath)
+    N = len(points)
+    if N == 0:
+        print(f"⚠️ No points to save for {filepath}")
+        return
+
+    if opacities is None:
+        opacities = np.full((N, 1), 4.5, dtype=np.float32)  # High opacity logit (~0.989)
+
+    # Spherical Harmonics DC (Degree 0) from RGB: f_dc = (rgb/255 - 0.5) / 0.28209479177387814
+    sh_dc = ((colors.astype(np.float32) / 255.0) - 0.5) / 0.28209479177387814
+    normals = np.zeros((N, 3), dtype=np.float32)
+
+    dtype = [
+        ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+        ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+        ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'),
+        ('opacity', 'f4'),
+        ('scale_0', 'f4'), ('scale_1', 'f4'), ('scale_2', 'f4'),
+        ('rot_0', 'f4'), ('rot_1', 'f4'), ('rot_2', 'f4'), ('rot_3', 'f4'),
+    ]
+
+    elements = np.empty(N, dtype=dtype)
+    elements['x'] = points[:, 0]
+    elements['y'] = points[:, 1]
+    elements['z'] = points[:, 2]
+    elements['nx'] = normals[:, 0]
+    elements['ny'] = normals[:, 1]
+    elements['nz'] = normals[:, 2]
+    elements['f_dc_0'] = sh_dc[:, 0]
+    elements['f_dc_1'] = sh_dc[:, 1]
+    elements['f_dc_2'] = sh_dc[:, 2]
+    elements['opacity'] = opacities[:, 0]
+    elements['scale_0'] = scales[:, 0]
+    elements['scale_1'] = scales[:, 1]
+    elements['scale_2'] = scales[:, 2]
+    elements['rot_0'] = quats[:, 0]
+    elements['rot_1'] = quats[:, 1]
+    elements['rot_2'] = quats[:, 2]
+    elements['rot_3'] = quats[:, 3]
+
+    header = f"""ply
+format binary_little_endian 1.0
+element vertex {N}
+property float x
+property float y
+property float z
+property float nx
+property float ny
+property float nz
+property float f_dc_0
+property float f_dc_1
+property float f_dc_2
+property float opacity
+property float scale_0
+property float scale_1
+property float scale_2
+property float rot_0
+property float rot_1
+property float rot_2
+property float rot_3
+end_header
+"""
+    with open(filepath, 'wb') as f:
+        f.write(header.encode('ascii'))
+        f.write(elements.tobytes())
+
+
+def depth_to_spherical_gaussians(
+    depth: np.ndarray,
+    rgb: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    stride: int = 1,
+    is_indoor: bool = True,
+    global_scale: float = 1.2,
+    disc_thickness: float = 0.2,
+    min_depth: float = 0.1,
+    max_depth: Optional[float] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Converts spherical equirectangular depth and RGB panorama into 3D Gaussian Splats.
+    
+    Args:
+        depth: [H, W] float32 radial depth/distance map.
+        rgb: [H, W, 3] uint8 RGB image.
+        mask: Optional [H, W] bool valid prediction mask.
+        stride: Pixel subsampling stride (1=full resolution).
+        is_indoor: True for indoor preset (default cutoff 15m), False for outdoor (default cutoff 80m).
+        global_scale: Splat radius scale multiplier.
+        disc_thickness: Disc thickness ratio relative to min(s1, s2).
+        min_depth: Minimum distance threshold in meters.
+        max_depth: Maximum distance cutoff in meters (defaults: 15.0m indoor, 80.0m outdoor).
+
+    Returns:
+        (flat_points, flat_rgb, flat_scales, flat_quats)
+    """
+    if max_depth is None:
+        max_depth = 15.0 if is_indoor else 80.0
+
+    H, W = depth.shape[:2]
+    if rgb.shape[:2] != (H, W):
+        rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_AREA)
+
+    if stride > 1:
+        depth = depth[::stride, ::stride]
+        rgb = rgb[::stride, ::stride]
+        if mask is not None:
+            mask = mask[::stride, ::stride]
+        H, W = depth.shape[:2]
+
+    u = np.linspace(0.5 / W, 1.0 - 0.5 / W, W, dtype=np.float32)
+    v = np.linspace(0.5 / H, 1.0 - 0.5 / H, H, dtype=np.float32)
+    u_grid, v_grid = np.meshgrid(u, v)
+
+    theta = (1.0 - u_grid) * (2.0 * np.pi)
+    phi = v_grid * np.pi
+
+    sin_phi = np.sin(phi)
+    cos_phi = np.cos(phi)
+    sin_theta = np.sin(theta)
+    cos_theta = np.cos(theta)
+
+    dx = sin_phi * cos_theta
+    dy = sin_phi * sin_theta
+    dz = cos_phi
+
+    dirs = np.stack([dx, dy, dz], axis=-1)
+    pts = (dirs * depth[..., None]).astype(np.float32)
+
+    t1 = np.stack([-sin_theta, cos_theta, np.zeros_like(theta)], axis=-1)
+    t2 = np.stack([cos_phi * cos_theta, cos_phi * sin_theta, -sin_phi], axis=-1)
+
+    d_theta = (2.0 * np.pi) / W
+    d_phi = np.pi / H
+
+    s1 = depth * (d_theta * sin_phi.clip(1e-3)) * global_scale
+    s2 = depth * d_phi * global_scale
+    s3 = disc_thickness * np.minimum(s1, s2)
+
+    log_scales = np.log(np.stack([s1, s2, s3], axis=-1).clip(1e-5, 1e2)).astype(np.float32)
+
+    R00, R01, R02 = t1[..., 0], t2[..., 0], dx
+    R10, R11, R12 = t1[..., 1], t2[..., 1], dy
+    R20, R21, R22 = t1[..., 2], t2[..., 2], dz
+
+    tr = R00 + R11 + R22
+    qw = np.sqrt(np.maximum(0.0, 1.0 + tr)) / 2.0
+    qx = (R21 - R12) / (4.0 * np.maximum(qw, 1e-6))
+    qy = (R02 - R20) / (4.0 * np.maximum(qw, 1e-6))
+    qz = (R10 - R01) / (4.0 * np.maximum(qw, 1e-6))
+
+    quats = np.stack([qw, qx, qy, qz], axis=-1).astype(np.float32)
+    q_norm = np.linalg.norm(quats, axis=-1, keepdims=True).clip(1e-6)
+    quats = quats / q_norm
+
+    valid = np.isfinite(depth) & (depth >= min_depth) & (depth <= max_depth)
+    if mask is not None:
+        valid = valid & mask
+
+    flat_pts = pts[valid].reshape(-1, 3)
+    flat_rgb = rgb[valid].reshape(-1, 3)
+    flat_scales = log_scales[valid].reshape(-1, 3)
+    flat_quats = quats[valid].reshape(-1, 4)
+
+    return flat_pts, flat_rgb, flat_scales, flat_quats
