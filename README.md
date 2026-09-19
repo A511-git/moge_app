@@ -4,6 +4,15 @@ A GPU-accelerated, self-contained **MoGe v3 Panorama Inference CLI** packaged in
 
 ---
 
+## 🌟 Key Features
+
+- **🚀 GPU-Accelerated Pipeline**: Matrix-free CUDA conjugate gradient Poisson solver for ultra-fast spherical depth merging and GPU-accelerated 3D Gaussian Splatting.
+- **🌐 3D Gaussian Splatting (`splat.ply`)**: Direct export of panoramic Gaussian splat point clouds compatible with WebGL viewers (SuperSplat, PlayCanvas, Luma, GSplat).
+- **📦 100% Self-Contained**: Zero external reliance on the original root `moge` repo; bundled with CUDA-compatible `utils3d_moge` and `flex_gemm`.
+- **⚙️ Configurable Presets**: Specialized indoor (15m cutoff) and outdoor (80m cutoff with sky removal) splat presets, customizable sampling strides, scales, and thickness.
+
+---
+
 ## 📁 Directory Structure
 
 ```text
@@ -12,7 +21,7 @@ Moge_CLI/
 │   ├── custom_deps/               # Bundled dependencies (utils3d_moge, flex_gemm, DEPENDENCIES.md)
 │   ├── model/                     # MoGe-3 ViT-L & ViT-G architectures, Sparse 3D UNet
 │   ├── panorama/                  # Spherical geometry, multi-view splitter & merger
-│   ├── utils/                     # Exporters, visualizers & download_weights.py
+│   ├── utils/                     # Exporters, visualizers, splat generators & download_weights.py
 │   └── infer_panorama.py          # Canonical MoGe-3 Panorama CLI script
 ├── app.py                         # Cross-platform CLI entrypoint
 ├── Dockerfile                     # Multi-stage build (builder -> slim runtime)
@@ -22,7 +31,6 @@ Moge_CLI/
 ├── .gitignore                     # Git tracking exclusions
 └── README.md
 ```
-
 
 ---
 
@@ -46,7 +54,31 @@ docker run --rm --gpus all \
   -o /data/output
 ```
 
-#### 2. Visual Maps & Raw EXR Outputs
+#### 2. Generate 3D Gaussian Splat (`splat.ply`)
+```bash
+# Generate full-resolution 3D Gaussian Splat for WebGL viewers
+docker run --rm --gpus all \
+  -v $(pwd)/checkpoints:/checkpoints \
+  -v $(pwd)/data:/data \
+  moge-panorama-cli \
+  -i /data/input_panorama.jpg \
+  -o /data/output \
+  --ply
+
+# Outdoor panorama with custom sampling stride (lighter splat for web viewer)
+docker run --rm --gpus all \
+  -v $(pwd)/checkpoints:/checkpoints \
+  -v $(pwd)/data:/data \
+  moge-panorama-cli \
+  -i /data/outdoor_panorama.jpg \
+  -o /data/output \
+  --ply \
+  --no-ply_is_indoor \
+  --ply_stride 2 \
+  --ply_max_depth 80.0
+```
+
+#### 3. Visual Maps & Raw EXR Outputs
 ```bash
 docker run --rm --gpus all \
   -v $(pwd)/checkpoints:/checkpoints \
@@ -57,7 +89,7 @@ docker run --rm --gpus all \
   --maps
 ```
 
-#### 3. Batch Folder Processing with High Precision (Refinement Steps = 5)
+#### 4. Batch Folder Processing with High Precision (Refinement Steps = 5)
 ```bash
 docker run --rm --gpus all \
   -v $(pwd)/checkpoints:/checkpoints \
@@ -67,10 +99,11 @@ docker run --rm --gpus all \
   -o /data/output_folder \
   --resolution_level 9 \
   --refine_steps 5 \
-  --maps
+  --maps \
+  --ply
 ```
 
-#### 4. Debug Mode (Save Splitted Perspective Views & Camera JSON Metadata)
+#### 5. Debug Mode (Save Splitted Perspective Views & Camera JSON Metadata)
 ```bash
 docker run --rm --gpus all \
   -v $(pwd)/checkpoints:/checkpoints \
@@ -106,3 +139,10 @@ All options can be configured via **CLI flags**, **Docker environment variables 
 | `--maps` | | `MOGE_MAPS` | `Flag` | `False` | Saves `depth_vis.png`, `normal_vis.png`, `.exr` files. |
 | `--depth_npy / --no-depth_npy` | | `MOGE_DEPTH_NPY` | `Bool` | `True` | Saves primary `depth.npy` float32 array. |
 | `--points_npy` | | `MOGE_POINTS_NPY` | `Flag` | `False` | Saves 3D coordinates `points.npy` array. |
+| `--ply` | | `MOGE_PLY` | `Flag` | `False` | Save 3D Gaussian Splatting `splat.ply` file. |
+| `--ply_is_indoor / --no-ply_is_indoor` | | `MOGE_PLY_IS_INDOOR` | `Bool` | `True` | Scene preset (indoor: max 15m cutoff; outdoor: max 80m cutoff with sky removal). |
+| `--ply_stride` | | `MOGE_PLY_STRIDE` | `Int` | `1` | Pixel sampling stride (1 = full res, 2 = half res for lightweight WebGL viewing). |
+| `--ply_scale` | | `MOGE_PLY_SCALE` | `Float` | `1.2` | Global splat radius scale multiplier. |
+| `--ply_thickness` | | `MOGE_PLY_THICKNESS` | `Float` | `0.2` | Splat disc thickness ratio. |
+| `--ply_min_depth` | | `MOGE_PLY_MIN_DEPTH` | `Float` | `0.1` | Minimum distance threshold in meters. |
+| `--ply_max_depth` | | `MOGE_PLY_MAX_DEPTH` | `Float` | `None` | Maximum distance cutoff in meters (`15.0m` indoor, `80.0m` outdoor by default). |
