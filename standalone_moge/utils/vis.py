@@ -1,10 +1,63 @@
-from typing import *
+import torch
 
-import numpy as np
-import matplotlib
+_CMAP_LUT_CACHE: Dict[Tuple[str, str], torch.Tensor] = {}
 
 
-def colorize_depth(depth: np.ndarray, mask: np.ndarray = None, normalize: bool = True, cmap: str = 'Spectral') -> np.ndarray:
+def get_cmap_lut_torch(cmap_name: str, device: torch.device) -> torch.Tensor:
+    key = (cmap_name, str(device))
+    if key not in _CMAP_LUT_CACHE:
+        lut_np = matplotlib.colormaps[cmap_name](np.linspace(0, 1, 256))[..., :3]
+        lut_uint8 = (lut_np * 255.0).clip(0, 255).astype(np.uint8)
+        _CMAP_LUT_CACHE[key] = torch.tensor(lut_uint8, dtype=torch.uint8, device=device)
+    return _CMAP_LUT_CACHE[key]
+
+
+def colorize_depth_torch(depth: torch.Tensor, mask: Optional[torch.Tensor] = None, normalize: bool = True, cmap: str = 'Spectral') -> torch.Tensor:
+    if mask is None:
+        valid = (depth > 0) & torch.isfinite(depth)
+    else:
+        valid = (depth > 0) & mask & torch.isfinite(depth)
+
+    if not valid.any():
+        return torch.zeros((*depth.shape, 3), dtype=torch.uint8, device=depth.device)
+
+    disp = 1.0 / torch.clamp(depth, min=1e-4)
+
+    if normalize:
+        valid_disp = disp[valid]
+        num_elements = valid_disp.numel()
+        if num_elements > 100_000:
+            step = max(1, num_elements // 50_000)
+            sample_disp = valid_disp[::step]
+        else:
+            sample_disp = valid_disp
+        q = torch.quantile(sample_disp.float(), torch.tensor([0.001, 0.99], device=depth.device))
+        min_disp, max_disp = q[0], q[1]
+        disp_norm = (disp - min_disp) / torch.clamp(max_disp - min_disp, min=1e-6)
+    else:
+        disp_norm = disp
+
+    val = torch.clamp(1.0 - disp_norm, 0.0, 1.0)
+    indices = torch.clamp((val * 255.0).round().long(), 0, 255)
+
+    lut = get_cmap_lut_torch(cmap, depth.device)
+    colored = lut[indices]
+    colored = torch.where(valid.unsqueeze(-1), colored, torch.zeros_like(colored))
+    return colored
+
+
+def colorize_normal_torch(normal: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    scale = torch.tensor([0.5, -0.5, -0.5], device=normal.device, dtype=normal.dtype)
+    n_colored = normal * scale + 0.5
+    n_uint8 = torch.clamp(n_colored * 255.0, 0.0, 255.0).to(torch.uint8)
+    if mask is not None:
+        n_uint8 = torch.where(mask.unsqueeze(-1), n_uint8, torch.zeros_like(n_uint8))
+    return n_uint8
+
+
+def colorize_depth(depth: Union[np.ndarray, torch.Tensor], mask: Optional[Union[np.ndarray, torch.Tensor]] = None, normalize: bool = True, cmap: str = 'Spectral') -> Union[np.ndarray, torch.Tensor]:
+    if isinstance(depth, torch.Tensor):
+        return colorize_depth_torch(depth, mask=mask, normalize=normalize, cmap=cmap)
     if mask is None:
         depth = np.where(depth > 0, depth, np.nan)
     else:
@@ -47,7 +100,9 @@ def colorize_segmentation(segmentation: np.ndarray, cmap: str = 'Set1') -> np.nd
     return colored
 
 
-def colorize_normal(normal: np.ndarray, mask: np.ndarray = None) -> np.ndarray:
+def colorize_normal(normal: Union[np.ndarray, torch.Tensor], mask: Optional[Union[np.ndarray, torch.Tensor]] = None) -> Union[np.ndarray, torch.Tensor]:
+    if isinstance(normal, torch.Tensor):
+        return colorize_normal_torch(normal, mask=mask)
     if mask is not None:
         normal = np.where(mask[..., None], normal, 0)
     normal = normal * [0.5, -0.5, -0.5] + 0.5

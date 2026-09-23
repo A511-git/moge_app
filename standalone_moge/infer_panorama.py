@@ -34,9 +34,10 @@ except ImportError:
 
 try:
     from standalone_moge.model import MoGeModel
-    from standalone_moge.utils.vis import colorize_depth, colorize_normal
+    from standalone_moge.utils.vis import colorize_depth, colorize_normal, colorize_depth_torch, colorize_normal_torch
     from standalone_moge.utils.panorama import (
         spherical_uv_to_directions,
+        spherical_uv_to_directions_torch,
         get_panorama_cameras,
         split_panorama_image,
         merge_panorama_depth,
@@ -47,9 +48,10 @@ try:
     from standalone_moge.utils.download_weights import download_single, normalize_model_name, MODELS
 except ImportError:
     from .model import MoGeModel
-    from .utils.vis import colorize_depth, colorize_normal
+    from .utils.vis import colorize_depth, colorize_normal, colorize_depth_torch, colorize_normal_torch
     from .utils.panorama import (
         spherical_uv_to_directions,
+        spherical_uv_to_directions_torch,
         get_panorama_cameras,
         split_panorama_image,
         merge_panorama_depth,
@@ -366,112 +368,126 @@ def main(
                 splitted_masks,
                 splitted_extrinsics,
                 splitted_intrinsics,
-                device=device
+                device=device,
+                return_torch=(device.type == 'cuda')
             )
-            panorama_depth = panorama_depth.astype(np.float32)
-
 
             t3 = time.time()
             print(f"[Timing] Merge panorama: {t3 - t2:.3f}s")
             # 4. Upscale back to EXACT original input image dimensions
+            is_torch = isinstance(panorama_depth, torch.Tensor)
 
-            if panorama_depth.shape[:2] != (target_height, target_width):
-
-                panorama_depth = cv2.resize(panorama_depth, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-
-                panorama_mask = cv2.resize(panorama_mask.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_NEAREST) > 0
-
+            if is_torch:
+                if panorama_depth.shape[:2] != (target_height, target_width):
+                    panorama_depth = F.interpolate(
+                        panorama_depth.unsqueeze(0).unsqueeze(0),
+                        size=(target_height, target_width),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0).squeeze(0)
+                    panorama_mask = F.interpolate(
+                        panorama_mask.float().unsqueeze(0).unsqueeze(0),
+                        size=(target_height, target_width),
+                        mode='nearest'
+                    ).squeeze(0).squeeze(0) > 0.5
+            else:
+                panorama_depth = panorama_depth.astype(np.float32)
+                if panorama_depth.shape[:2] != (target_height, target_width):
+                    panorama_depth = cv2.resize(panorama_depth, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+                    panorama_mask = cv2.resize(panorama_mask.astype(np.uint8), (target_width, target_height), interpolation=cv2.INTER_NEAREST) > 0
 
             # Compute 3D coordinate points only if requested for points.npy or visual maps
-
             points = None
-
             if save_points_npy or save_maps_:
-
-                uv = utils3d.np.uv_map(target_height, target_width)
-
-                directions = spherical_uv_to_directions(uv)
-
-                points = panorama_depth[:, :, None] * directions
-
+                if is_torch:
+                    directions = spherical_uv_to_directions_torch(target_height, target_width, device=device)
+                    points = panorama_depth.unsqueeze(-1) * directions
+                    del directions
+                else:
+                    uv = utils3d.np.uv_map(target_height, target_width)
+                    directions = spherical_uv_to_directions(uv)
+                    points = panorama_depth[:, :, None] * directions
 
             # Track generated file paths
-
             npy_files = {}
-
             map_files = {}
-
             debug_files = {}
 
-
             # Write primary depth.npy
-
             if save_depth_npy:
-
                 depth_npy_p = save_path / 'depth.npy'
-
-                np.save(str(depth_npy_p), panorama_depth)
-
+                np_depth = panorama_depth.detach().cpu().numpy().astype(np.float32) if is_torch else panorama_depth.astype(np.float32)
+                np.save(str(depth_npy_p), np_depth)
                 npy_files['depth.npy'] = str(depth_npy_p.resolve())
 
-
             if save_points_npy:
-
                 points_npy_p = save_path / 'points.npy'
-
-                np.save(str(points_npy_p), points)
-
+                np_points = points.detach().cpu().numpy().astype(np.float32) if is_torch else points.astype(np.float32)
+                np.save(str(points_npy_p), np_points)
                 npy_files['points.npy'] = str(points_npy_p.resolve())
 
-
             # Write optional visual maps
-
             if save_maps_:
-
-                normals, normals_mask = utils3d.np.point_map_to_normal_map(points, panorama_mask)
-
-
                 img_p = save_path / 'image.jpg'
-
                 cv2.imwrite(str(img_p), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-
                 map_files['image.jpg'] = str(img_p.resolve())
 
+                if is_torch:
+                    normals, normals_mask = utils3d.pt.point_map_to_normal_map(points, panorama_mask)
 
-                dvis_p = save_path / 'depth_vis.png'
+                    dvis_p = save_path / 'depth_vis.png'
+                    depth_vis_t = colorize_depth_torch(panorama_depth, mask=panorama_mask)
+                    cv2.imwrite(str(dvis_p), cv2.cvtColor(depth_vis_t.cpu().numpy(), cv2.COLOR_RGB2BGR))
+                    map_files['depth_vis.png'] = str(dvis_p.resolve())
+                    del depth_vis_t
 
-                cv2.imwrite(str(dvis_p), cv2.cvtColor(colorize_depth(panorama_depth, mask=panorama_mask), cv2.COLOR_RGB2BGR))
+                    nvis_p = save_path / 'normal_vis.png'
+                    normal_vis_t = colorize_normal_torch(normals, mask=normals_mask)
+                    cv2.imwrite(str(nvis_p), cv2.cvtColor(normal_vis_t.cpu().numpy(), cv2.COLOR_RGB2BGR))
+                    map_files['normal_vis.png'] = str(nvis_p.resolve())
+                    del normal_vis_t
 
-                map_files['depth_vis.png'] = str(dvis_p.resolve())
+                    dexr_p = save_path / 'depth.exr'
+                    np_depth_exr = panorama_depth.detach().cpu().numpy().astype(np.float32)
+                    cv2.imwrite(str(dexr_p), np_depth_exr, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    map_files['depth.exr'] = str(dexr_p.resolve())
 
+                    pexr_p = save_path / 'points.exr'
+                    np_points_exr = points.detach().cpu().numpy().astype(np.float32)
+                    cv2.imwrite(str(pexr_p), np_points_exr, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    map_files['points.exr'] = str(pexr_p.resolve())
 
-                nvis_p = save_path / 'normal_vis.png'
+                    mask_p = save_path / 'mask.png'
+                    np_mask = (panorama_mask.detach().cpu().numpy() * 255).astype(np.uint8)
+                    cv2.imwrite(str(mask_p), np_mask)
+                    map_files['mask.png'] = str(mask_p.resolve())
 
-                cv2.imwrite(str(nvis_p), cv2.cvtColor(colorize_normal(normals, mask=normals_mask), cv2.COLOR_RGB2BGR))
+                    del normals, normals_mask
+                else:
+                    normals, normals_mask = utils3d.np.point_map_to_normal_map(points, panorama_mask)
 
-                map_files['normal_vis.png'] = str(nvis_p.resolve())
+                    dvis_p = save_path / 'depth_vis.png'
+                    cv2.imwrite(str(dvis_p), cv2.cvtColor(colorize_depth(panorama_depth, mask=panorama_mask), cv2.COLOR_RGB2BGR))
+                    map_files['depth_vis.png'] = str(dvis_p.resolve())
 
+                    nvis_p = save_path / 'normal_vis.png'
+                    cv2.imwrite(str(nvis_p), cv2.cvtColor(colorize_normal(normals, mask=normals_mask), cv2.COLOR_RGB2BGR))
+                    map_files['normal_vis.png'] = str(nvis_p.resolve())
 
-                dexr_p = save_path / 'depth.exr'
+                    dexr_p = save_path / 'depth.exr'
+                    cv2.imwrite(str(dexr_p), panorama_depth, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    map_files['depth.exr'] = str(dexr_p.resolve())
 
-                cv2.imwrite(str(dexr_p), panorama_depth, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    pexr_p = save_path / 'points.exr'
+                    cv2.imwrite(str(pexr_p), points, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    map_files['points.exr'] = str(pexr_p.resolve())
 
-                map_files['depth.exr'] = str(dexr_p.resolve())
+                    mask_p = save_path / 'mask.png'
+                    cv2.imwrite(str(mask_p), (panorama_mask * 255).astype(np.uint8))
+                    map_files['mask.png'] = str(mask_p.resolve())
 
-
-                pexr_p = save_path / 'points.exr'
-
-                cv2.imwrite(str(pexr_p), points, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-
-                map_files['points.exr'] = str(pexr_p.resolve())
-
-
-                mask_p = save_path / 'mask.png'
-
-                cv2.imwrite(str(mask_p), (panorama_mask * 255).astype(np.uint8))
-
-                map_files['mask.png'] = str(mask_p.resolve())
-
+            if points is not None:
+                del points
 
             if save_debug:
                 debug_files['debug_folder'] = str((save_path / 'splitted').resolve())
@@ -494,6 +510,7 @@ def main(
                 splat_p = save_path / 'splat.ply'
                 save_gaussian_splat_ply(str(splat_p), pts, cols, scs, qts)
                 ply_files['splat.ply'] = str(splat_p.resolve())
+                del pts, cols, scs, qts
 
             t4 = time.time()
             print(f"[Timing] Upscale & Postprocess: {t4 - t3:.3f}s")

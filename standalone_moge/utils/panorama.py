@@ -334,8 +334,9 @@ def merge_panorama_depth(
     pred_masks: Union[List[np.ndarray], List[torch.Tensor]],
     extrinsics: Union[List[np.ndarray], List[torch.Tensor]],
     intrinsics: Union[List[np.ndarray], List[torch.Tensor]],
-    device: Optional[Union[str, torch.device]] = None
-) -> Tuple[np.ndarray, np.ndarray]:
+    device: Optional[Union[str, torch.device]] = None,
+    return_torch: bool = False
+) -> Tuple[Union[np.ndarray, torch.Tensor], Union[np.ndarray, torch.Tensor]]:
     """
     Public entrypoint for multi-scale panoramic METRIC DISTANCE merging.
     Executes 100% on GPU if CUDA is available, or CPU fallback.
@@ -371,6 +372,8 @@ def merge_panorama_depth(
             intrinsics_tensors=intr_tensors,
             device=device
         )
+        if return_torch:
+            return depth_gpu, mask_gpu
         return depth_gpu.detach().cpu().numpy().astype(np.float32), mask_gpu.detach().cpu().numpy()
 
     # CPU fallback
