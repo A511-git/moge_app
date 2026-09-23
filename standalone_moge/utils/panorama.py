@@ -175,22 +175,48 @@ def solve_poisson_cg_torch(
 def merge_panorama_depth_gpu(
     width: int,
     height: int,
-    distance_tensors: List[torch.Tensor],
-    pred_mask_tensors: List[torch.Tensor],
-    extrinsics_tensors: List[torch.Tensor],
-    intrinsics_tensors: List[torch.Tensor],
+    distance_tensors: Union[List[torch.Tensor], torch.Tensor],
+    pred_mask_tensors: Union[List[torch.Tensor], torch.Tensor],
+    extrinsics_tensors: Union[List[torch.Tensor], torch.Tensor],
+    intrinsics_tensors: Union[List[torch.Tensor], torch.Tensor],
     device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     100% GPU-Accelerated Multi-Scale Spherical Warping, Gradient Blending, and Poisson Solver.
-    Executes entirely within PyTorch CUDA VRAM with zero host-device synchronization bottlenecks.
+    Fully batched across all 12 views in parallel on CUDA with zero host-device synchronization bottlenecks.
     """
+    # Convert lists to batched GPU tensors once
+    if isinstance(distance_tensors, list):
+        dist_batch = torch.stack(distance_tensors, dim=0)
+    else:
+        dist_batch = distance_tensors
+    if dist_batch.dim() == 3:
+        dist_batch = dist_batch.unsqueeze(1)  # [N, 1, tile_H, tile_W]
+
+    if isinstance(pred_mask_tensors, list):
+        mask_batch = torch.stack(pred_mask_tensors, dim=0)
+    else:
+        mask_batch = pred_mask_tensors
+    if mask_batch.dim() == 3:
+        mask_batch = mask_batch.unsqueeze(1)  # [N, 1, tile_H, tile_W]
+    mask_batch = mask_batch.float()
+
+    if isinstance(extrinsics_tensors, list):
+        ext_batch = torch.stack(extrinsics_tensors, dim=0)  # [N, 4, 4]
+    else:
+        ext_batch = extrinsics_tensors
+
+    if isinstance(intrinsics_tensors, list):
+        intr_batch = torch.stack(intrinsics_tensors, dim=0)  # [N, 3, 3]
+    else:
+        intr_batch = intrinsics_tensors
+
     # 1. Multi-scale coarse-to-fine initialization
     if max(width, height) > 256:
         coarse_depth, _ = merge_panorama_depth_gpu(
             width // 2, height // 2,
-            distance_tensors, pred_mask_tensors,
-            extrinsics_tensors, intrinsics_tensors,
+            dist_batch, mask_batch,
+            ext_batch, intr_batch,
             device=device
         )
         panorama_depth_init = F.interpolate(
@@ -205,96 +231,75 @@ def merge_panorama_depth_gpu(
     # 2. Compute (H, W, 3) 3D unit ray directions directly on GPU
     spherical_dirs = spherical_uv_to_directions_torch(height, width, device=device)  # [H, W, 3]
 
-    grad_x_list, grad_y_list = [], []
-    mask_x_list, mask_y_list = [], []
-    lap_list, mask_lap_list = [], []
-    all_pred_masks = []
-
     lap_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
     lap_mask_kernel = torch.tensor([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
 
-    num_views = len(distance_tensors)
-    for i in range(num_views):
-        dist_t = distance_tensors[i]        # [tile_H, tile_W]
-        mask_t = pred_mask_tensors[i]       # [tile_H, tile_W]
-        ext_t = extrinsics_tensors[i]       # [4, 4]
-        intr_t = intrinsics_tensors[i]      # [3, 3]
+    N = dist_batch.shape[0]
+    R_batch = ext_batch[:, :3, :3]  # [N, 3, 3]
+    t_batch = ext_batch[:, :3, 3]   # [N, 3]
 
-        tile_h, tile_w = dist_t.shape[:2]
+    # Project 3D rays into all view camera frames in parallel: P_cam = dirs @ R^T + t
+    p_cam = torch.einsum('hwc, nkc -> nhwk', spherical_dirs, R_batch) + t_batch.view(N, 1, 1, 3)  # [N, H, W, 3]
+    z_cam = p_cam[..., 2]
 
-        # Project 3D rays into view camera frame on CUDA: P_cam = dirs @ R^T + t
-        R = ext_t[:3, :3]
-        t = ext_t[:3, 3]
-        p_cam = torch.matmul(spherical_dirs, R.T) + t.view(1, 1, 3)  # [H, W, 3]
-        z_cam = p_cam[..., 2]
+    # Perspective projection to normalized camera screen coordinates across all views
+    z_safe = torch.where(z_cam > 1e-4, z_cam, torch.ones_like(z_cam))
+    x_norm = p_cam[..., 0] / z_safe
+    y_norm = p_cam[..., 1] / z_safe
 
-        # Perspective projection to normalized camera screen coordinates
-        z_safe = torch.where(z_cam > 1e-4, z_cam, torch.ones_like(z_cam))
-        x_norm = p_cam[..., 0] / z_safe
-        y_norm = p_cam[..., 1] / z_safe
+    fx = intr_batch[:, 0, 0].view(N, 1, 1)
+    cx = intr_batch[:, 0, 2].view(N, 1, 1)
+    fy = intr_batch[:, 1, 1].view(N, 1, 1)
+    cy = intr_batch[:, 1, 2].view(N, 1, 1)
 
-        u_cam = intr_t[0, 0] * x_norm + intr_t[0, 2]
-        v_cam = intr_t[1, 1] * y_norm + intr_t[1, 2]
+    u_cam = fx * x_norm + cx
+    v_cam = fy * y_norm + cy
 
-        valid_proj = (z_cam > 0) & (u_cam >= 0.0) & (u_cam <= 1.0) & (v_cam >= 0.0) & (v_cam <= 1.0)
+    valid_proj = (z_cam > 0) & (u_cam >= 0.0) & (u_cam <= 1.0) & (v_cam >= 0.0) & (v_cam <= 1.0)
 
-        # Convert [0, 1] UV to [-1, 1] normalized grid for F.grid_sample
-        grid_x = 2.0 * u_cam - 1.0
-        grid_y = 2.0 * v_cam - 1.0
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # [1, H, W, 2]
+    # Convert [0, 1] UV to [-1, 1] normalized sampling grids for F.grid_sample
+    grid_x = 2.0 * u_cam - 1.0
+    grid_y = 2.0 * v_cam - 1.0
+    grid = torch.stack([grid_x, grid_y], dim=-1)  # [N, H, W, 2]
 
-        log_dist_tile = torch.log(torch.clamp(dist_t, min=1e-4, max=1e4)).unsqueeze(0).unsqueeze(0)
-        mask_tile_f = mask_t.float().unsqueeze(0).unsqueeze(0)
+    log_dist_batch = torch.log(torch.clamp(dist_batch, min=1e-4, max=1e4))
 
-        # Warp tile onto spherical equirectangular domain on CUDA
-        warped_log_dist = F.grid_sample(log_dist_tile, grid, mode='bilinear', padding_mode='border', align_corners=False).squeeze(0).squeeze(0)
-        warped_mask = F.grid_sample(mask_tile_f, grid, mode='nearest', padding_mode='zeros', align_corners=False).squeeze(0).squeeze(0)
+    # Single batched warp of all views onto spherical equirectangular domain on CUDA
+    warped_log_dist = F.grid_sample(log_dist_batch, grid, mode='bilinear', padding_mode='border', align_corners=False).squeeze(1)  # [N, H, W]
+    warped_mask = F.grid_sample(mask_batch, grid, mode='nearest', padding_mode='zeros', align_corners=False).squeeze(1)          # [N, H, W]
 
-        pano_log_dist = torch.where(valid_proj, warped_log_dist, torch.zeros_like(warped_log_dist))
-        pano_mask = valid_proj & (warped_mask > 0.5)
+    pano_log_dist = torch.where(valid_proj, warped_log_dist, torch.zeros_like(warped_log_dist))
+    pano_mask = valid_proj & (warped_mask > 0.5)
 
-        # Gradients with horizontal circular wrap
-        padded_dist = torch.cat([pano_log_dist, pano_log_dist[:, :1]], dim=1)
-        gx = padded_dist[:, :-1] - padded_dist[:, 1:]
-        gy = padded_dist[:-1, :] - padded_dist[1:, :]
+    # Batched gradients with horizontal circular wrap
+    padded_dist = torch.cat([pano_log_dist, pano_log_dist[:, :, :1]], dim=2)  # [N, H, W+1]
+    gx = padded_dist[:, :, :-1] - padded_dist[:, :, 1:]                       # [N, H, W]
+    gy = padded_dist[:, :-1, :] - padded_dist[:, 1:, :]                       # [N, H-1, W+1]
 
-        padded_mask = torch.cat([pano_mask, pano_mask[:, :1]], dim=1)
-        mx = padded_mask[:, :-1] & padded_mask[:, 1:]
-        my = padded_mask[:-1, :] & padded_mask[1:, :]
+    padded_mask = torch.cat([pano_mask, pano_mask[:, :, :1]], dim=2)          # [N, H, W+1]
+    mx = padded_mask[:, :, :-1] & padded_mask[:, :, 1:]                       # [N, H, W]
+    my = padded_mask[:, :-1, :] & padded_mask[:, 1:, :]                       # [N, H-1, W+1]
 
-        grad_x_list.append(gx)
-        grad_y_list.append(gy)
-        mask_x_list.append(mx)
-        mask_y_list.append(my)
+    # Batched 2D Laplacians on CUDA (single convolution across all views)
+    pad_dist_lap = F.pad(pano_log_dist.unsqueeze(1), (1, 1, 0, 0), mode='circular')
+    pad_dist_lap = F.pad(pad_dist_lap, (0, 0, 1, 1), mode='replicate')
+    lap = F.conv2d(pad_dist_lap, lap_kernel).squeeze(1)                        # [N, H, W]
 
-        # 2D Laplacian on CUDA
-        pad_dist_lap = F.pad(pano_log_dist.unsqueeze(0).unsqueeze(0), (1, 1, 0, 0), mode='circular')
-        pad_dist_lap = F.pad(pad_dist_lap, (0, 0, 1, 1), mode='replicate')
-        lap = F.conv2d(pad_dist_lap, lap_kernel).squeeze(0).squeeze(0)
+    pad_mask_lap = F.pad(pano_mask.float().unsqueeze(1), (1, 1, 0, 0), mode='circular')
+    pad_mask_lap = F.pad(pad_mask_lap, (0, 0, 1, 1), mode='replicate')
+    mlap = (F.conv2d(pad_mask_lap, lap_mask_kernel).squeeze(1) >= 4.5)         # [N, H, W]
 
-        pad_mask_lap = F.pad(pano_mask.float().unsqueeze(0).unsqueeze(0), (1, 1, 0, 0), mode='circular')
-        pad_mask_lap = F.pad(pad_mask_lap, (0, 0, 1, 1), mode='replicate')
-        mlap = (F.conv2d(pad_mask_lap, lap_mask_kernel).squeeze(0).squeeze(0) >= 4.5)
-
-        lap_list.append(lap)
-        mask_lap_list.append(mlap)
-        all_pred_masks.append(pano_mask)
-
-    # 3. Aggregate overlapping gradients & Laplacians across all 12 views on GPU
-    stack_gx = torch.stack(grad_x_list, dim=0)
-    stack_gy = torch.stack(grad_y_list, dim=0)
-    stack_mx = torch.stack(mask_x_list, dim=0).float()
-    stack_my = torch.stack(mask_y_list, dim=0).float()
-
+    # 3. Direct batched reduction across all views on GPU
+    stack_mx = mx.float()
+    stack_my = my.float()
     sum_mx = torch.sum(stack_mx, dim=0)
     sum_my = torch.sum(stack_my, dim=0)
-    avg_gx = torch.sum(stack_gx * stack_mx, dim=0) / torch.clamp(sum_mx, min=1e-3)
-    avg_gy = torch.sum(stack_gy * stack_my, dim=0) / torch.clamp(sum_my, min=1e-3)
+    avg_gx = torch.sum(gx * stack_mx, dim=0) / torch.clamp(sum_mx, min=1e-3)
+    avg_gy = torch.sum(gy * stack_my, dim=0) / torch.clamp(sum_my, min=1e-3)
 
-    stack_lap = torch.stack(lap_list, dim=0)
-    stack_mlap = torch.stack(mask_lap_list, dim=0).float()
+    stack_mlap = mlap.float()
     sum_mlap = torch.sum(stack_mlap, dim=0)
-    avg_lap = torch.sum(stack_lap * stack_mlap, dim=0) / torch.clamp(sum_mlap, min=1e-3)
+    avg_lap = torch.sum(lap * stack_mlap, dim=0) / torch.clamp(sum_mlap, min=1e-3)
 
     mask_x_valid = (sum_mx > 0).float()
     mask_y_valid = (sum_my > 0).float()
@@ -317,7 +322,7 @@ def merge_panorama_depth_gpu(
     )
 
     pano_depth = torch.exp(x_gpu)
-    pano_mask = torch.stack(all_pred_masks, dim=0).any(dim=0)
+    pano_mask = pano_mask.any(dim=0)
 
     return pano_depth, pano_mask
 
