@@ -19,6 +19,7 @@ import cv2
 import click
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm, trange
 
 try:
