@@ -433,29 +433,38 @@ def main(
                 cv2.imwrite(str(img_p), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
                 map_files['image.jpg'] = str(img_p.resolve())
 
+                # EXR flags: 32-bit float with compression bypass (instant disk writing)
+                exr_flags = [
+                    cv2.IMWRITE_EXR_TYPE,
+                    cv2.IMWRITE_EXR_TYPE_FLOAT,
+                    getattr(cv2, 'IMWRITE_EXR_COMPRESSION', 49),
+                    getattr(cv2, 'IMWRITE_EXR_COMPRESSION_NONE', getattr(cv2, 'IMWRITE_EXR_COMPRESSION_NO', 0))
+                ]
+
                 if is_torch:
                     normals, normals_mask = utils3d.pt.point_map_to_normal_map(points, panorama_mask)
 
                     dvis_p = save_path / 'depth_vis.png'
                     depth_vis_t = colorize_depth_torch(panorama_depth, mask=panorama_mask)
-                    cv2.imwrite(str(dvis_p), cv2.cvtColor(depth_vis_t.cpu().numpy(), cv2.COLOR_RGB2BGR))
+                    # Fast GPU RGB->BGR channel permute before DMA copy
+                    cv2.imwrite(str(dvis_p), depth_vis_t[..., [2, 1, 0]].contiguous().cpu().numpy())
                     map_files['depth_vis.png'] = str(dvis_p.resolve())
                     del depth_vis_t
 
                     nvis_p = save_path / 'normal_vis.png'
                     normal_vis_t = colorize_normal_torch(normals, mask=normals_mask)
-                    cv2.imwrite(str(nvis_p), cv2.cvtColor(normal_vis_t.cpu().numpy(), cv2.COLOR_RGB2BGR))
+                    cv2.imwrite(str(nvis_p), normal_vis_t[..., [2, 1, 0]].contiguous().cpu().numpy())
                     map_files['normal_vis.png'] = str(nvis_p.resolve())
                     del normal_vis_t
 
                     dexr_p = save_path / 'depth.exr'
                     np_depth_exr = panorama_depth.detach().cpu().numpy().astype(np.float32)
-                    cv2.imwrite(str(dexr_p), np_depth_exr, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    cv2.imwrite(str(dexr_p), np_depth_exr, exr_flags)
                     map_files['depth.exr'] = str(dexr_p.resolve())
 
                     pexr_p = save_path / 'points.exr'
                     np_points_exr = points.detach().cpu().numpy().astype(np.float32)
-                    cv2.imwrite(str(pexr_p), np_points_exr, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    cv2.imwrite(str(pexr_p), np_points_exr, exr_flags)
                     map_files['points.exr'] = str(pexr_p.resolve())
 
                     mask_p = save_path / 'mask.png'
@@ -476,11 +485,11 @@ def main(
                     map_files['normal_vis.png'] = str(nvis_p.resolve())
 
                     dexr_p = save_path / 'depth.exr'
-                    cv2.imwrite(str(dexr_p), panorama_depth, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    cv2.imwrite(str(dexr_p), panorama_depth, exr_flags)
                     map_files['depth.exr'] = str(dexr_p.resolve())
 
                     pexr_p = save_path / 'points.exr'
-                    cv2.imwrite(str(pexr_p), points, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+                    cv2.imwrite(str(pexr_p), points, exr_flags)
                     map_files['points.exr'] = str(pexr_p.resolve())
 
                     mask_p = save_path / 'mask.png'
@@ -493,21 +502,35 @@ def main(
             if save_debug:
                 debug_files['debug_folder'] = str((save_path / 'splitted').resolve())
 
-            # Write optional 3D Gaussian Splat
+            # Write optional 3D Gaussian Splat directly on GPU
             ply_files = {}
             if save_ply:
-                pts, cols, scs, qts = depth_to_spherical_gaussians(
-                    panorama_depth,
-                    image,
-                    mask=panorama_mask,
-                    stride=ply_stride,
-                    is_indoor=ply_is_indoor,
-                    global_scale=ply_scale,
-                    disc_thickness=ply_thickness,
-                    min_depth=ply_min_depth,
-                    max_depth=ply_max_depth,
-                    device=device
-                )
+                if is_torch:
+                    pts, cols, scs, qts = depth_to_spherical_gaussians_torch(
+                        depth=panorama_depth,
+                        rgb=image,
+                        mask=panorama_mask,
+                        stride=ply_stride,
+                        is_indoor=ply_is_indoor,
+                        global_scale=ply_scale,
+                        disc_thickness=ply_thickness,
+                        min_depth=ply_min_depth,
+                        max_depth=ply_max_depth,
+                        device=device
+                    )
+                else:
+                    pts, cols, scs, qts = depth_to_spherical_gaussians(
+                        panorama_depth,
+                        image,
+                        mask=panorama_mask,
+                        stride=ply_stride,
+                        is_indoor=ply_is_indoor,
+                        global_scale=ply_scale,
+                        disc_thickness=ply_thickness,
+                        min_depth=ply_min_depth,
+                        max_depth=ply_max_depth,
+                        device=device
+                    )
                 splat_p = save_path / 'splat.ply'
                 save_gaussian_splat_ply(str(splat_p), pts, cols, scs, qts)
                 ply_files['splat.ply'] = str(splat_p.resolve())

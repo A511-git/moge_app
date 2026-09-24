@@ -449,55 +449,75 @@ def save_gaussian_splat_ply(
     filepath = Path(filepath)
 
     if isinstance(points, torch.Tensor):
-        points = points.detach().cpu().numpy()
-    if isinstance(colors, torch.Tensor):
-        colors = colors.detach().cpu().numpy()
-    if isinstance(scales, torch.Tensor):
-        scales = scales.detach().cpu().numpy()
-    if isinstance(quats, torch.Tensor):
-        quats = quats.detach().cpu().numpy()
-    if opacities is not None and isinstance(opacities, torch.Tensor):
-        opacities = opacities.detach().cpu().numpy()
+        N = points.shape[0]
+        if N == 0:
+            print(f"⚠️ No points to save for {filepath}")
+            return
 
-    N = len(points)
-    if N == 0:
-        print(f"⚠️ No points to save for {filepath}")
-        return
+        device = points.device
+        pts = points.to(dtype=torch.float32)
 
-    if opacities is None:
-        opacities = np.full((N, 1), 4.5, dtype=np.float32)  # High opacity logit (~0.989)
+        # Colors / Spherical Harmonics DC on GPU
+        if not isinstance(colors, torch.Tensor):
+            colors = torch.as_tensor(colors, device=device)
+        else:
+            colors = colors.to(device=device)
+        sh_dc = ((colors.float() / 255.0) - 0.5) / 0.28209479177387814
 
-    # Spherical Harmonics DC (Degree 0) from RGB: f_dc = (rgb/255 - 0.5) / 0.28209479177387814
-    sh_dc = ((colors.astype(np.float32) / 255.0) - 0.5) / 0.28209479177387814
-    normals = np.zeros((N, 3), dtype=np.float32)
+        # Normals (zeros)
+        normals = torch.zeros((N, 3), dtype=torch.float32, device=device)
 
-    dtype = [
-        ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-        ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
-        ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'),
-        ('opacity', 'f4'),
-        ('scale_0', 'f4'), ('scale_1', 'f4'), ('scale_2', 'f4'),
-        ('rot_0', 'f4'), ('rot_1', 'f4'), ('rot_2', 'f4'), ('rot_3', 'f4'),
-    ]
+        # Opacities
+        if opacities is None:
+            opacities = torch.full((N, 1), 4.5, dtype=torch.float32, device=device)
+        else:
+            if not isinstance(opacities, torch.Tensor):
+                opacities = torch.as_tensor(opacities, dtype=torch.float32, device=device)
+            else:
+                opacities = opacities.to(device=device, dtype=torch.float32)
+            if opacities.ndim == 1:
+                opacities = opacities.unsqueeze(-1)
 
-    elements = np.empty(N, dtype=dtype)
-    elements['x'] = points[:, 0]
-    elements['y'] = points[:, 1]
-    elements['z'] = points[:, 2]
-    elements['nx'] = normals[:, 0]
-    elements['ny'] = normals[:, 1]
-    elements['nz'] = normals[:, 2]
-    elements['f_dc_0'] = sh_dc[:, 0]
-    elements['f_dc_1'] = sh_dc[:, 1]
-    elements['f_dc_2'] = sh_dc[:, 2]
-    elements['opacity'] = opacities[:, 0]
-    elements['scale_0'] = scales[:, 0]
-    elements['scale_1'] = scales[:, 1]
-    elements['scale_2'] = scales[:, 2]
-    elements['rot_0'] = quats[:, 0]
-    elements['rot_1'] = quats[:, 1]
-    elements['rot_2'] = quats[:, 2]
-    elements['rot_3'] = quats[:, 3]
+        # Scales & Quaternions
+        if not isinstance(scales, torch.Tensor):
+            scales = torch.as_tensor(scales, dtype=torch.float32, device=device)
+        else:
+            scales = scales.to(device=device, dtype=torch.float32)
+
+        if not isinstance(quats, torch.Tensor):
+            quats = torch.as_tensor(quats, dtype=torch.float32, device=device)
+        else:
+            quats = quats.to(device=device, dtype=torch.float32)
+
+        # Assemble 17 float32 columns in 1 GPU kernel: [x,y,z, nx,ny,nz, fdc0,fdc1,fdc2, opacity, sc0,sc1,sc2, rot0,rot1,rot2,rot3]
+        packed = torch.cat([pts, normals, sh_dc, opacities, scales, quats], dim=-1)
+        raw_bytes = packed.contiguous().cpu().numpy().tobytes()
+    else:
+        N = len(points)
+        if N == 0:
+            print(f"⚠️ No points to save for {filepath}")
+            return
+
+        if opacities is None:
+            opacities = np.full((N, 1), 4.5, dtype=np.float32)
+        elif opacities.ndim == 1:
+            opacities = opacities[:, None]
+
+        sh_dc = ((colors.astype(np.float32) / 255.0) - 0.5) / 0.28209479177387814
+        normals = np.zeros((N, 3), dtype=np.float32)
+
+        packed = np.ascontiguousarray(
+            np.concatenate([
+                points.astype(np.float32),
+                normals,
+                sh_dc.astype(np.float32),
+                opacities.astype(np.float32),
+                scales.astype(np.float32),
+                quats.astype(np.float32)
+            ], axis=-1),
+            dtype=np.float32
+        )
+        raw_bytes = packed.tobytes()
 
     header = f"""ply
 format binary_little_endian 1.0
@@ -523,7 +543,7 @@ end_header
 """
     with open(filepath, 'wb') as f:
         f.write(header.encode('ascii'))
-        f.write(elements.tobytes())
+        f.write(raw_bytes)
 
 
 def depth_to_spherical_gaussians_torch(
