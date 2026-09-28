@@ -86,8 +86,8 @@ def solve_poisson_cg_torch(
     mask_y: torch.Tensor,
     mask_lap: torch.Tensor,
     x0: Optional[torch.Tensor] = None,
-    max_iter: int = 150,
-    tol: float = 1e-5,
+    max_iter: int = 2000,
+    tol: float = 1e-6,
     device: torch.device = torch.device('cuda')
 ) -> torch.Tensor:
     """
@@ -121,7 +121,7 @@ def solve_poisson_cg_torch(
 
         # Gy^T: [H - 1, W + 1] -> folded to [H, W]
         g_pad_y = F.pad(gy.unsqueeze(0).unsqueeze(0), (0, 0, 1, 1), mode='constant', value=0).squeeze(0).squeeze(0)
-        diff_y = g_pad_y[:-1, :] - g_pad_y[1:, :]
+        diff_y = g_pad_y[1:, :] - g_pad_y[:-1, :]
         at_gy = diff_y[:, :W].clone()
         at_gy[:, 0] = at_gy[:, 0] + diff_y[:, W]
 
@@ -146,8 +146,9 @@ def solve_poisson_cg_torch(
 
     p = r.clone()
     rsold = torch.sum(r * r)
+    r0 = torch.sqrt(torch.sum(rhs * rhs)).clamp_min(1e-12)
 
-    if rsold < tol:
+    if torch.sqrt(rsold) < tol * r0:
         return x
 
     for i in range(max_iter):
@@ -163,7 +164,7 @@ def solve_poisson_cg_torch(
         r = r - alpha * Ap
         rsnew = torch.sum(r * r)
 
-        if torch.sqrt(rsnew) < tol:
+        if torch.sqrt(rsnew) < tol * r0:
             break
 
         p = r + (rsnew / rsold) * p
@@ -316,8 +317,8 @@ def merge_panorama_depth_gpu(
         mask_y=mask_y_valid,
         mask_lap=mask_lap_valid,
         x0=t_x0,
-        max_iter=120,
-        tol=1e-5,
+        max_iter=2000,
+        tol=1e-6,
         device=device
     )
 
@@ -429,7 +430,7 @@ def merge_panorama_depth(
     t_my = torch.tensor((sum_my > 0).astype(np.float32), dtype=torch.float32, device=device)
     t_mlap = torch.tensor((sum_mlap > 0).astype(np.float32), dtype=torch.float32, device=device)
 
-    x = solve_poisson_cg_torch(grad_x=t_gx, grad_y=t_gy, laplacian=t_lap, mask_x=t_mx, mask_y=t_my, mask_lap=t_mlap, max_iter=120, tol=1e-5, device=device).detach().cpu().numpy()
+    x = solve_poisson_cg_torch(grad_x=t_gx, grad_y=t_gy, laplacian=t_lap, mask_x=t_mx, mask_y=t_my, mask_lap=t_mlap, max_iter=2000, tol=1e-6, device=device).detach().cpu().numpy()
     return np.exp(x).astype(np.float32), np.any(panorama_pred_masks, axis=0)
 
 
