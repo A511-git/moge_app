@@ -48,3 +48,6 @@ desktop.ini
 *.log
 *.tmp
 .cache/
+
+
+jobdata
