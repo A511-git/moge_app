@@ -111,6 +111,7 @@ def _infer_faces(
 @click.option("--resolution_level", type=int, default=9, show_default=True)
 @click.option("--num_tokens", type=int, default=None)
 @click.option("--refine_steps", type=click.IntRange(min=0), default=3, show_default=True)
+@click.option("--resize", "resize_to", type=int, default=None, help="Max dimension ceiling for input panoramas (default: None = keep original resolution).")
 @click.option("--split_resolution", type=int, default=512, show_default=True)
 @click.option("--batch_size", type=int, default=4, show_default=True)
 @click.option("--min_depth", type=float, default=0.1, show_default=True, help="Minimum valid depth/distance in meters.")
@@ -133,6 +134,7 @@ def main(
     resolution_level: int,
     num_tokens: Optional[int],
     refine_steps: int,
+    resize_to: Optional[int],
     split_resolution: int,
     batch_size: int,
     min_depth: float,
@@ -200,7 +202,12 @@ def main(
             print(f"[WARNING] Skipping unreadable image: {image_path}")
             continue
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        height, width = image_rgb.shape[:2]
+        orig_height, orig_width = image_rgb.shape[:2]
+        height, width = orig_height, orig_width
+        if resize_to is not None and (orig_height > resize_to or orig_width > resize_to):
+            height = min(resize_to, int(resize_to * orig_height / orig_width))
+            width = min(resize_to, int(resize_to * orig_width / orig_height))
+            image_rgb = cv2.resize(image_rgb, (width, height), interpolation=cv2.INTER_AREA)
 
         T_pano_to_moge = compute_panorama_moge_pose(origin, heading)
         face_c2w_list, face_w2c_list = compute_face_moge_poses(T_pano_to_moge, local_extrinsics)
