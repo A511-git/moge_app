@@ -120,6 +120,7 @@ def _infer_faces(
 @click.option("--depth_scale_file", type=click.Path(exists=True), default=None, help="Optional JSON file with per-jobId depth scales (auto-uses moge_depth_scales.json in --input or alongside jobdata.json if present).")
 @click.option("--depth_scale_metric", type=click.Choice(["median", "mean"]), default="median", show_default=True, help="Scale metric to use from --depth_scale_file.")
 @click.option("--no_depth_scale", is_flag=True, default=False, help="Disable per-jobId depth scaling even if moge_depth_scales.json is present.")
+@click.option("--no_flex", is_flag=True, default=False, help="Disable flex Gemma tuning and use direct inference (forces refine_steps=0 and num_tokens=None).")
 def main(
     input_path: str,
     metadata_path: Optional[str],
@@ -143,7 +144,13 @@ def main(
     depth_scale_file: Optional[str],
     depth_scale_metric: str,
     no_depth_scale: bool,
+    no_flex: bool,
 ) -> None:
+    if no_flex:
+        refine_steps = 0
+        num_tokens = None
+        print("[MoGe World] --no_flex: flex Gemma tuning disabled; using direct inference (refine_steps=0, num_tokens=None).")
+
     matched, meta_file = discover_panorama_inputs(input_path, metadata_path)
     if not matched:
         raise FileNotFoundError(f"No panoramas in {input_path} matched records in {meta_file}")
