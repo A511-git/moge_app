@@ -15,6 +15,8 @@ from standalone_moge.utils.moge_world_poses import (
     discover_panorama_inputs,
     extract_heading,
     extract_origin_xyz,
+    get_depth_scale,
+    load_depth_scales,
     transform_points_to_world,
     voxel_downsample_points,
     write_rgb_ply,
@@ -143,9 +145,19 @@ def test_synthetic_two_panorama_merge_and_ply() -> None:
         assert f"element vertex {len(ds_pts)}".encode("ascii") in data
 
 
+def test_depth_scales_loading() -> None:
+    scales_path = Path(__file__).resolve().parent / "jobdata" / "moge_depth_scales.json"
+    scales = load_depth_scales(scales_path)
+    assert abs(get_depth_scale(scales, "9oPhlqgwrM", metric="median") - 1.8772) < 1e-6
+    assert abs(get_depth_scale(scales, "9oPhlqgwrM", metric="mean") - 2.5576) < 1e-6
+    assert get_depth_scale(scales, "nonexistent", metric="median") == 1.0
+    assert get_depth_scale(None, "9oPhlqgwrM", metric="median") == 1.0
+
+
 if __name__ == "__main__":
     test_so3_rotations()
     test_jobdata_origin_pose_alignment()
     test_face_to_world_ray_consistency()
     test_synthetic_two_panorama_merge_and_ply()
-    print("ALL 4 TESTS PASSED")
+    test_depth_scales_loading()
+    print("ALL 5 TESTS PASSED")

@@ -98,7 +98,9 @@ def discover_panorama_inputs(
     if metadata_path is not None:
         meta_file = Path(metadata_path)
     else:
-        candidates = list(in_path.glob("jobdata.json")) or list(in_path.glob("*.json"))
+        candidates = list(in_path.glob("jobdata.json")) or [
+            p for p in sorted(in_path.glob("*.json")) if p.name != "moge_depth_scales.json"
+        ]
         if not candidates:
             raise FileNotFoundError(f"No metadata JSON found in {in_path}")
         meta_file = candidates[0]
@@ -268,3 +270,30 @@ def write_rgb_ply(filepath: Union[str, Path], points: np.ndarray, colors: np.nda
         handle.write(header.encode("ascii"))
         if n > 0:
             handle.write(structured.tobytes())
+
+
+def load_depth_scales(scale_file_path: Union[str, Path]) -> Dict[str, dict]:
+    """Load per-jobId depth scale dictionary (e.g. moge_depth_scales.json)."""
+    path = Path(scale_file_path)
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object keyed by jobId")
+    return data
+
+
+def get_depth_scale(
+    scales: Optional[Dict[str, dict]],
+    job_id: str,
+    metric: str = "median",
+) -> float:
+    """Return depth scale multiplier for job_id using metric ('median' or 'mean'), defaulting to 1.0."""
+    if not scales or job_id not in scales:
+        return 1.0
+    entry = scales[job_id]
+    if isinstance(entry, (int, float)):
+        return float(entry)
+    val = entry.get(metric)
+    if val is None:
+        return 1.0
+    return float(val)

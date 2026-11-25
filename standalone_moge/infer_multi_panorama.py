@@ -39,6 +39,8 @@ from standalone_moge.utils.moge_world_poses import (
     discover_panorama_inputs,
     extract_heading,
     extract_origin_xyz,
+    get_depth_scale,
+    load_depth_scales,
     transform_points_to_world,
     voxel_downsample_points,
     write_rgb_ply,
@@ -114,6 +116,9 @@ def _infer_faces(
 @click.option("--min_depth", type=float, default=0.1, show_default=True, help="Minimum valid depth/distance in meters.")
 @click.option("--max_depth", type=float, default=15.0, show_default=True, help="Maximum valid depth/distance in meters.")
 @click.option("--voxel_size", type=float, default=0.02, show_default=True, help="Voxel size in meters for pointcloud.ply downsampling (0 = full dense).")
+@click.option("--depth_scale_file", type=click.Path(exists=True), default=None, help="Optional JSON file with per-jobId depth scales (auto-uses moge_depth_scales.json in --input or alongside jobdata.json if present).")
+@click.option("--depth_scale_metric", type=click.Choice(["median", "mean"]), default="median", show_default=True, help="Scale metric to use from --depth_scale_file.")
+@click.option("--no_depth_scale", is_flag=True, default=False, help="Disable per-jobId depth scaling even if moge_depth_scales.json is present.")
 def main(
     input_path: str,
     metadata_path: Optional[str],
@@ -133,10 +138,26 @@ def main(
     min_depth: float,
     max_depth: float,
     voxel_size: float,
+    depth_scale_file: Optional[str],
+    depth_scale_metric: str,
+    no_depth_scale: bool,
 ) -> None:
     matched, meta_file = discover_panorama_inputs(input_path, metadata_path)
     if not matched:
         raise FileNotFoundError(f"No panoramas in {input_path} matched records in {meta_file}")
+
+    depth_scales = None
+    if no_depth_scale:
+        print("[MoGe World] Depth scaling disabled (--no_depth_scale); using scale=1.0.")
+    elif depth_scale_file is not None:
+        depth_scales = load_depth_scales(depth_scale_file)
+        print(f"[MoGe World] Using depth scales ({depth_scale_metric}) from: {depth_scale_file}")
+    else:
+        for candidate in (Path(input_path) / "moge_depth_scales.json", meta_file.parent / "moge_depth_scales.json"):
+            if candidate.is_file():
+                depth_scales = load_depth_scales(candidate)
+                print(f"[MoGe World] Auto-detected depth scales ({depth_scale_metric}) from: {candidate}")
+                break
 
     device = torch.device(device_name if torch.cuda.is_available() and "cuda" in device_name else "cpu")
     if use_fp16 and device.type != "cuda":
@@ -199,20 +220,23 @@ def main(
 
         pano_out_dir = out_dir / job_id
         pano_out_dir.mkdir(parents=True, exist_ok=True)
+        depth_scale = get_depth_scale(depth_scales, job_id, metric=depth_scale_metric)
 
         if merge_mode == "faces":
             for idx, (f_img, f_depth, f_pts, f_mask, f_c2w) in enumerate(
                 zip(splitted_images, face_depths, face_points, face_masks, face_c2w_list)
             ):
-                np.save(str(pano_out_dir / f"face_{idx:02d}_depth.npy"), f_depth.astype(np.float32))
+                scaled_depth = (f_depth * depth_scale).astype(np.float32)
+                scaled_pts = (f_pts * depth_scale).astype(np.float32)
+                np.save(str(pano_out_dir / f"face_{idx:02d}_depth.npy"), scaled_depth)
                 valid = (
                     np.asarray(f_mask, dtype=bool)
-                    & np.isfinite(f_depth)
-                    & (f_depth >= min_depth)
-                    & (f_depth <= max_depth)
+                    & np.isfinite(scaled_depth)
+                    & (scaled_depth >= min_depth)
+                    & (scaled_depth <= max_depth)
                 )
                 if np.any(valid):
-                    pts_world = transform_points_to_world(f_pts[valid], f_c2w)
+                    pts_world = transform_points_to_world(scaled_pts[valid], f_c2w)
                     all_world_pts.append(pts_world)
                     all_world_cols.append(f_img[valid])
         else:
@@ -253,6 +277,7 @@ def main(
                     pano_depth_np = cv2.resize(pano_depth_np, (width, height), interpolation=cv2.INTER_LINEAR)
                     pano_mask_np = cv2.resize(pano_mask_np.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST) > 0
 
+            pano_depth_np = (pano_depth_np * depth_scale).astype(np.float32)
             np.save(str(pano_out_dir / "depth.npy"), pano_depth_np)
 
             uv = utils3d.np.uv_map(height, width)
@@ -274,6 +299,8 @@ def main(
                 "jobId": job_id,
                 "headingDeg": float(heading),
                 "headingSource": heading_source,
+                "depthScale": float(depth_scale),
+                "depthScaleMetric": depth_scale_metric,
                 "T_pano_to_moge_world": T_pano_to_moge.tolist(),
                 "face_c2w_moge_world": [m.tolist() for m in face_c2w_list],
                 "face_w2c_moge_world": [m.tolist() for m in face_w2c_list],
