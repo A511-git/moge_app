@@ -175,6 +175,103 @@ def _prepare_panorama(
     }
 
 
+def _append_pose_summary(
+    prepared: Dict[str, Any],
+    *,
+    depth_scale: float,
+    depth_scale_metric: str,
+    heading_source: str,
+    poses_summary: List[Dict[str, Any]],
+) -> None:
+    poses_summary.append(
+        {
+            "jobId": prepared["job_id"],
+            "headingDeg": float(prepared["heading"]),
+            "headingSource": heading_source,
+            "depthScale": float(depth_scale),
+            "depthScaleMetric": depth_scale_metric,
+            "T_pano_to_moge_world": prepared["T_pano_to_moge"].tolist(),
+            "face_c2w_moge_world": [m.tolist() for m in prepared["face_c2w_list"]],
+            "face_w2c_moge_world": [m.tolist() for m in prepared["face_w2c_list"]],
+        }
+    )
+
+
+def _resize_pano_depth_mask(
+    pano_depth,
+    pano_mask,
+    height: int,
+    width: int,
+):
+    """Resize merged equirect depth/mask to (height, width); returns numpy arrays."""
+    if isinstance(pano_depth, torch.Tensor):
+        if pano_depth.shape[:2] != (height, width):
+            pano_depth = F.interpolate(
+                pano_depth.unsqueeze(0).unsqueeze(0),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+            pano_mask = (
+                F.interpolate(
+                    pano_mask.float().unsqueeze(0).unsqueeze(0),
+                    size=(height, width),
+                    mode="nearest",
+                ).squeeze(0).squeeze(0)
+                > 0.5
+            )
+        pano_depth_np = pano_depth.detach().cpu().numpy().astype(np.float32)
+        pano_mask_np = pano_mask.detach().cpu().numpy().astype(bool)
+    else:
+        pano_depth_np = pano_depth.astype(np.float32)
+        pano_mask_np = pano_mask.astype(bool)
+        if pano_depth_np.shape[:2] != (height, width):
+            pano_depth_np = cv2.resize(pano_depth_np, (width, height), interpolation=cv2.INTER_LINEAR)
+            pano_mask_np = (
+                cv2.resize(pano_mask_np.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST) > 0
+            )
+    return pano_depth_np, pano_mask_np
+
+
+def _collect_scaled_face_world_points(
+    prepared: Dict[str, Any],
+    face_depths: List[np.ndarray],
+    face_points: List[np.ndarray],
+    face_masks: List[np.ndarray],
+    *,
+    depth_scale: float,
+    min_depth: float,
+    max_depth: float,
+    save_face_depths_dir: Optional[Path] = None,
+) -> tuple:
+    """Return (world_pts_list, world_cols_list) for one pano's faces."""
+    pts_chunks: List[np.ndarray] = []
+    col_chunks: List[np.ndarray] = []
+    for idx, (f_img, f_depth, f_pts, f_mask, f_c2w) in enumerate(
+        zip(
+            prepared["splitted_images"],
+            face_depths,
+            face_points,
+            face_masks,
+            prepared["face_c2w_list"],
+        )
+    ):
+        scaled_depth = (f_depth * depth_scale).astype(np.float32)
+        scaled_pts = (f_pts * depth_scale).astype(np.float32)
+        if save_face_depths_dir is not None:
+            np.save(str(save_face_depths_dir / f"face_{idx:02d}_depth.npy"), scaled_depth)
+        valid = (
+            np.asarray(f_mask, dtype=bool)
+            & np.isfinite(scaled_depth)
+            & (scaled_depth >= min_depth)
+            & (scaled_depth <= max_depth)
+        )
+        if np.any(valid):
+            pts_chunks.append(transform_points_to_world(scaled_pts[valid], f_c2w))
+            col_chunks.append(f_img[valid])
+    return pts_chunks, col_chunks
+
+
 def _merge_prepared_pano(
     prepared: Dict[str, Any],
     face_depths: List[np.ndarray],
@@ -195,39 +292,31 @@ def _merge_prepared_pano(
     all_world_cols: List[np.ndarray],
     poses_summary: List[Dict[str, Any]],
 ) -> None:
-    """Apply merge_mode / depth scale / world accumulate for one prepared panorama."""
+    """Apply per-pano merge_mode (faces | pano_then_world) and accumulate world points."""
     job_id = prepared["job_id"]
-    heading = prepared["heading"]
     image_rgb = prepared["image_rgb"]
     height = prepared["height"]
     width = prepared["width"]
     T_pano_to_moge = prepared["T_pano_to_moge"]
-    face_c2w_list = prepared["face_c2w_list"]
-    face_w2c_list = prepared["face_w2c_list"]
-    splitted_images = prepared["splitted_images"]
 
     pano_out_dir = out_dir / job_id
     pano_out_dir.mkdir(parents=True, exist_ok=True)
     depth_scale = get_depth_scale(depth_scales, job_id, metric=depth_scale_metric)
 
     if merge_mode == "faces":
-        for idx, (f_img, f_depth, f_pts, f_mask, f_c2w) in enumerate(
-            zip(splitted_images, face_depths, face_points, face_masks, face_c2w_list)
-        ):
-            scaled_depth = (f_depth * depth_scale).astype(np.float32)
-            scaled_pts = (f_pts * depth_scale).astype(np.float32)
-            np.save(str(pano_out_dir / f"face_{idx:02d}_depth.npy"), scaled_depth)
-            valid = (
-                np.asarray(f_mask, dtype=bool)
-                & np.isfinite(scaled_depth)
-                & (scaled_depth >= min_depth)
-                & (scaled_depth <= max_depth)
-            )
-            if np.any(valid):
-                pts_world = transform_points_to_world(scaled_pts[valid], f_c2w)
-                all_world_pts.append(pts_world)
-                all_world_cols.append(f_img[valid])
-    else:
+        pts_chunks, col_chunks = _collect_scaled_face_world_points(
+            prepared,
+            face_depths,
+            face_points,
+            face_masks,
+            depth_scale=depth_scale,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            save_face_depths_dir=pano_out_dir,
+        )
+        all_world_pts.extend(pts_chunks)
+        all_world_cols.extend(col_chunks)
+    elif merge_mode == "pano_then_world":
         face_distances = [np.linalg.norm(p, axis=-1).astype(np.float32) for p in face_points]
         merging_w, merging_h = min(1920, width), min(960, height)
         pano_depth, pano_mask = merge_panorama_depth(
@@ -240,31 +329,7 @@ def _merge_prepared_pano(
             device=device,
             return_torch=(device.type == "cuda"),
         )
-        if isinstance(pano_depth, torch.Tensor):
-            if pano_depth.shape[:2] != (height, width):
-                pano_depth = F.interpolate(
-                    pano_depth.unsqueeze(0).unsqueeze(0),
-                    size=(height, width),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0).squeeze(0)
-                pano_mask = (
-                    F.interpolate(
-                        pano_mask.float().unsqueeze(0).unsqueeze(0),
-                        size=(height, width),
-                        mode="nearest",
-                    ).squeeze(0).squeeze(0)
-                    > 0.5
-                )
-            pano_depth_np = pano_depth.detach().cpu().numpy().astype(np.float32)
-            pano_mask_np = pano_mask.detach().cpu().numpy().astype(bool)
-        else:
-            pano_depth_np = pano_depth.astype(np.float32)
-            pano_mask_np = pano_mask.astype(bool)
-            if pano_depth_np.shape[:2] != (height, width):
-                pano_depth_np = cv2.resize(pano_depth_np, (width, height), interpolation=cv2.INTER_LINEAR)
-                pano_mask_np = cv2.resize(pano_mask_np.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST) > 0
-
+        pano_depth_np, pano_mask_np = _resize_pano_depth_mask(pano_depth, pano_mask, height, width)
         pano_depth_np = (pano_depth_np * depth_scale).astype(np.float32)
         np.save(str(pano_out_dir / "depth.npy"), pano_depth_np)
 
@@ -278,29 +343,184 @@ def _merge_prepared_pano(
             & (pano_depth_np <= max_depth)
         )
         if np.any(valid):
-            pts_world = transform_points_to_world(pts_pano[valid], T_pano_to_moge)
-            all_world_pts.append(pts_world)
+            all_world_pts.append(transform_points_to_world(pts_pano[valid], T_pano_to_moge))
             all_world_cols.append(image_rgb[valid])
+    else:
+        raise ValueError(f"Per-pano merge does not support merge_mode={merge_mode!r}")
 
-    poses_summary.append(
-        {
-            "jobId": job_id,
-            "headingDeg": float(heading),
-            "headingSource": heading_source,
-            "depthScale": float(depth_scale),
-            "depthScaleMetric": depth_scale_metric,
-            "T_pano_to_moge_world": T_pano_to_moge.tolist(),
-            "face_c2w_moge_world": [m.tolist() for m in face_c2w_list],
-            "face_w2c_moge_world": [m.tolist() for m in face_w2c_list],
-        }
+    _append_pose_summary(
+        prepared,
+        depth_scale=depth_scale,
+        depth_scale_metric=depth_scale_metric,
+        heading_source=heading_source,
+        poses_summary=poses_summary,
     )
+
+
+def _merge_all_faces_world(
+    prepared_panos: List[Dict[str, Any]],
+    *,
+    out_dir: Path,
+    depth_scales: Optional[Dict[str, Any]],
+    depth_scale_metric: str,
+    heading_source: str,
+    min_depth: float,
+    max_depth: float,
+    voxel_size: float,
+    all_world_pts: List[np.ndarray],
+    all_world_cols: List[np.ndarray],
+    poses_summary: List[Dict[str, Any]],
+) -> None:
+    """Pose all N*12 faces into MoGe world and voxel-fuse overlaps into one cloud."""
+    n_faces = sum(len(p["face_points"]) for p in prepared_panos)
+    print(
+        f"[MoGe World][merge] all_faces_world: fusing {n_faces} posed faces from "
+        f"{len(prepared_panos)} panos in world space (voxel_size={voxel_size})"
+    )
+    for prepared in prepared_panos:
+        job_id = prepared["job_id"]
+        pano_out_dir = out_dir / job_id
+        pano_out_dir.mkdir(parents=True, exist_ok=True)
+        depth_scale = get_depth_scale(depth_scales, job_id, metric=depth_scale_metric)
+        pts_chunks, col_chunks = _collect_scaled_face_world_points(
+            prepared,
+            prepared["face_depths"],
+            prepared["face_points"],
+            prepared["face_masks"],
+            depth_scale=depth_scale,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            save_face_depths_dir=pano_out_dir,
+        )
+        all_world_pts.extend(pts_chunks)
+        all_world_cols.extend(col_chunks)
+        _append_pose_summary(
+            prepared,
+            depth_scale=depth_scale,
+            depth_scale_metric=depth_scale_metric,
+            heading_source=heading_source,
+            poses_summary=poses_summary,
+        )
+    if voxel_size <= 0.0:
+        print(
+            "[MoGe World][merge] WARNING: all_faces_world with voxel_size=0 skips overlap fusion; "
+            "points are concatenated only. Use --voxel_size > 0 to average overlaps."
+        )
+
+
+def _merge_all_faces_sphere(
+    prepared_panos: List[Dict[str, Any]],
+    *,
+    out_dir: Path,
+    depth_scales: Optional[Dict[str, Any]],
+    depth_scale_metric: str,
+    heading_source: str,
+    local_extrinsics: np.ndarray,
+    local_intrinsics: List[np.ndarray],
+    device: torch.device,
+    min_depth: float,
+    max_depth: float,
+    all_world_pts: List[np.ndarray],
+    all_world_cols: List[np.ndarray],
+    poses_summary: List[Dict[str, Any]],
+) -> None:
+    """
+    Force one equirect Poisson blend of all N*12 faces on a shared sphere.
+
+    Geometrically assumes a shared panorama center (local icosahedron extrinsics
+    repeated per pano). World unprojection uses the first panorama pose.
+    """
+    n_faces = sum(len(p["face_points"]) for p in prepared_panos)
+    print(
+        f"[MoGe World][merge] all_faces_sphere: Poisson-blending {n_faces} faces "
+        f"from {len(prepared_panos)} panos onto one equirect sphere"
+    )
+    print(
+        "[MoGe World][merge] WARNING: all_faces_sphere ignores per-pano translation; "
+        "only valid when panos share roughly the same center. "
+        f"World pose taken from first pano jobId={prepared_panos[0]['job_id']}."
+    )
+
+    face_distances: List[np.ndarray] = []
+    face_masks: List[np.ndarray] = []
+    face_extrinsics: List[np.ndarray] = []
+    face_intrinsics: List[np.ndarray] = []
+
+    for prepared in prepared_panos:
+        job_id = prepared["job_id"]
+        depth_scale = get_depth_scale(depth_scales, job_id, metric=depth_scale_metric)
+        pano_out_dir = out_dir / job_id
+        pano_out_dir.mkdir(parents=True, exist_ok=True)
+        n = len(prepared["face_points"])
+        for idx, (f_depth, f_pts, f_mask) in enumerate(
+            zip(prepared["face_depths"], prepared["face_points"], prepared["face_masks"])
+        ):
+            scaled_depth = (f_depth * depth_scale).astype(np.float32)
+            scaled_pts = (f_pts * depth_scale).astype(np.float32)
+            np.save(str(pano_out_dir / f"face_{idx:02d}_depth.npy"), scaled_depth)
+            face_distances.append(np.linalg.norm(scaled_pts, axis=-1).astype(np.float32))
+            face_masks.append(np.asarray(f_mask, dtype=bool))
+        # Repeat the same 12 local cameras for each pano (shared-sphere assumption).
+        face_extrinsics.extend([local_extrinsics[i] for i in range(n)])
+        face_intrinsics.extend(local_intrinsics[:n])
+        _append_pose_summary(
+            prepared,
+            depth_scale=depth_scale,
+            depth_scale_metric=depth_scale_metric,
+            heading_source=heading_source,
+            poses_summary=poses_summary,
+        )
+
+    anchor = prepared_panos[0]
+    height, width = int(anchor["height"]), int(anchor["width"])
+    merging_w, merging_h = min(1920, width), min(960, height)
+    pano_depth, pano_mask = merge_panorama_depth(
+        merging_w,
+        merging_h,
+        face_distances,
+        face_masks,
+        face_extrinsics,
+        face_intrinsics,
+        device=device,
+        return_torch=(device.type == "cuda"),
+    )
+    pano_depth_np, pano_mask_np = _resize_pano_depth_mask(pano_depth, pano_mask, height, width)
+    np.save(str(out_dir / "depth_all_faces_sphere.npy"), pano_depth_np)
+    print(f"[MoGe World][merge] Wrote shared-sphere depth -> {out_dir / 'depth_all_faces_sphere.npy'}")
+
+    uv = utils3d.np.uv_map(height, width)
+    dirs = spherical_uv_to_directions(uv)
+    pts_pano = pano_depth_np[:, :, None] * dirs
+    valid = (
+        pano_mask_np
+        & np.isfinite(pano_depth_np)
+        & (pano_depth_np >= min_depth)
+        & (pano_depth_np <= max_depth)
+    )
+    if np.any(valid):
+        all_world_pts.append(transform_points_to_world(pts_pano[valid], anchor["T_pano_to_moge"]))
+        image_rgb = anchor["image_rgb"]
+        if image_rgb.shape[:2] != (height, width):
+            image_rgb = cv2.resize(image_rgb, (width, height), interpolation=cv2.INTER_AREA)
+        all_world_cols.append(image_rgb[valid])
 
 
 @click.command(help="Multi-Panorama MoGe-3 Reconstruction in Single MoGe World Axis")
 @click.option("--input", "-i", "input_path", type=click.Path(exists=True), required=True, help="Directory of equirectangular panoramas.")
 @click.option("--metadata", "-j", "metadata_path", type=click.Path(exists=True), default=None, help="Path to jobdata.json (defaults to jobdata.json inside --input).")
 @click.option("--output", "-o", "output_path", type=click.Path(), default="./output_world", show_default=True, help="Output directory for depth.npy and pointcloud.ply.")
-@click.option("--merge_mode", type=click.Choice(["pano_then_world", "faces"]), default="pano_then_world", show_default=True, help="'pano_then_world': merge 12 faces per pano first via merge_panorama_depth then merge worlds; 'faces': merge all N*12 posed faces directly.")
+@click.option(
+    "--merge_mode",
+    type=click.Choice(["pano_then_world", "faces", "all_faces_world", "all_faces_sphere"]),
+    default="pano_then_world",
+    show_default=True,
+    help=(
+        "'pano_then_world': Poisson-merge 12 faces per pano then concat worlds; "
+        "'faces': pose each face to world separately; "
+        "'all_faces_world': pose all N*12 faces to world then voxel-fuse overlaps; "
+        "'all_faces_sphere': Poisson-blend all N*12 faces on one shared equirect sphere (assumes shared center)."
+    ),
+)
 @click.option("--infer_mode", type=click.Choice(["per_pano", "all_faces"]), default="per_pano", show_default=True, help="'per_pano': infer each pano's 12 faces separately; 'all_faces': queue all N*12 faces then infer (chunked by --batch_size).")
 @click.option("--heading_source", type=click.Choice(["magneticHeading", "originHeading"]), default="magneticHeading", show_default=True, help="Heading field from jobdata.json (default matches handoff doc).")
 @click.option("--model", "-m", "model_name", type=click.Choice(["vitl", "vitg", "moge-3-vitl", "moge-3-vitg"]), default="vitl", show_default=True)
@@ -461,30 +681,14 @@ def main(
         )
 
         offset = 0
-        for prepared in tqdm(prepared_panos, desc="Merging panoramas"):
+        for prepared in prepared_panos:
             n = len(prepared["splitted_images"])
-            _merge_prepared_pano(
-                prepared,
-                all_depths[offset : offset + n],
-                all_points[offset : offset + n],
-                all_masks[offset : offset + n],
-                out_dir=out_dir,
-                merge_mode=merge_mode,
-                depth_scales=depth_scales,
-                depth_scale_metric=depth_scale_metric,
-                heading_source=heading_source,
-                local_extrinsics=local_extrinsics,
-                local_intrinsics=local_intrinsics,
-                device=device,
-                min_depth=min_depth,
-                max_depth=max_depth,
-                all_world_pts=all_world_pts,
-                all_world_cols=all_world_cols,
-                poses_summary=poses_summary,
-            )
+            prepared["face_depths"] = all_depths[offset : offset + n]
+            prepared["face_points"] = all_points[offset : offset + n]
+            prepared["face_masks"] = all_masks[offset : offset + n]
             offset += n
     else:
-        for prepared in tqdm(prepared_panos, desc="Panoramas"):
+        for prepared in tqdm(prepared_panos, desc="Inferring panoramas"):
             print(
                 f"[MoGe World][infer] per_pano: queueing {len(prepared['splitted_images'])} faces "
                 f"for jobId={prepared['job_id']}"
@@ -495,11 +699,17 @@ def main(
                 face_owners=[prepared["job_id"]] * len(prepared["splitted_images"]),
                 **infer_kwargs,
             )
+            prepared["face_depths"] = face_depths
+            prepared["face_points"] = face_points
+            prepared["face_masks"] = face_masks
+
+    if merge_mode in ("pano_then_world", "faces"):
+        for prepared in tqdm(prepared_panos, desc="Merging panoramas"):
             _merge_prepared_pano(
                 prepared,
-                face_depths,
-                face_points,
-                face_masks,
+                prepared["face_depths"],
+                prepared["face_points"],
+                prepared["face_masks"],
                 out_dir=out_dir,
                 merge_mode=merge_mode,
                 depth_scales=depth_scales,
@@ -514,6 +724,38 @@ def main(
                 all_world_cols=all_world_cols,
                 poses_summary=poses_summary,
             )
+    elif merge_mode == "all_faces_world":
+        _merge_all_faces_world(
+            prepared_panos,
+            out_dir=out_dir,
+            depth_scales=depth_scales,
+            depth_scale_metric=depth_scale_metric,
+            heading_source=heading_source,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            voxel_size=voxel_size,
+            all_world_pts=all_world_pts,
+            all_world_cols=all_world_cols,
+            poses_summary=poses_summary,
+        )
+    elif merge_mode == "all_faces_sphere":
+        _merge_all_faces_sphere(
+            prepared_panos,
+            out_dir=out_dir,
+            depth_scales=depth_scales,
+            depth_scale_metric=depth_scale_metric,
+            heading_source=heading_source,
+            local_extrinsics=local_extrinsics,
+            local_intrinsics=local_intrinsics,
+            device=device,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            all_world_pts=all_world_pts,
+            all_world_cols=all_world_cols,
+            poses_summary=poses_summary,
+        )
+    else:
+        raise ValueError(f"Unknown merge_mode={merge_mode!r}")
 
     if not all_world_pts:
         raise RuntimeError("No valid 3D points generated across any panorama.")
