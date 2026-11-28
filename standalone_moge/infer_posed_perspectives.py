@@ -252,28 +252,32 @@ def fuse_cameras_auto(
             raise RuntimeError(
                 f"{view.name}: MoGe depth {depth.shape} != image {rgb.shape[0]}x{rgb.shape[1]}"
             )
+        # MoGe depth is already metric. Scale 1, placed with cameraToWorld, is what
+        # lands both views on one surface. metricScale (~5) then pushes each cloud
+        # out along its own camera rays, so that shared surface splits into two sheets.
+        # unaligned_by_source.ply is the stretched cloud. aligned_*.ply is scale 1.
         scaled_depth = np.asarray(depth, dtype=np.float64) * float(view.metric_scale)
         valid = _valid_pixels(points, scaled_depth, mask, depth_max=depth_max)
-        world_raw, _ = _cloud_from_view(points, rgb, valid, view.camera_to_world, 1.0)
-        world_scaled, point_colors = _cloud_from_view(
+        world_metric, metric_colors = _cloud_from_view(points, rgb, valid, view.camera_to_world, 1.0)
+        world_stretched, _ = _cloud_from_view(
             points, rgb, valid, view.camera_to_world, view.metric_scale
         )
         median_depth = median_valid_depth(
-            scaled_depth,
+            depth,
             valid,
             depth_max=depth_max,
         )
         print(
-            f"[posed] {view.name}: median scaled depth {median_depth:.3f} m, points {len(world_scaled)}"
+            f"[posed] {view.name}: median depth {median_depth:.3f} m, points {len(world_metric)}"
         )
-        if len(world_raw):
-            unaligned_points.append(world_raw.astype(np.float32))
-            unaligned_colors.append(_tint(len(world_raw), index))
-        if len(world_scaled):
-            aligned_points.append(world_scaled.astype(np.float32))
-            aligned_colors.append(_tint(len(world_scaled), index))
-            rgb_points.append(world_scaled.astype(np.float32))
-            rgb_colors.append(point_colors)
+        if len(world_stretched):
+            unaligned_points.append(world_stretched.astype(np.float32))
+            unaligned_colors.append(_tint(len(world_stretched), index))
+        if len(world_metric):
+            aligned_points.append(world_metric.astype(np.float32))
+            aligned_colors.append(_tint(len(world_metric), index))
+            rgb_points.append(world_metric.astype(np.float32))
+            rgb_colors.append(metric_colors)
 
         view_records.append(
             {
@@ -291,7 +295,7 @@ def fuse_cameras_auto(
                 "origin": [float(v) for v in view.origin],
                 "metric_scale": float(view.metric_scale),
                 "median_depth_m": _json_float(median_depth),
-                "scale": float(view.metric_scale),
+                "scale": 1.0,
             }
         )
 
@@ -315,7 +319,7 @@ def fuse_cameras_auto(
         "units": document.units,
         "max_depth_m": float(depth_max),
         "metric_scale": float(document.metric_scale),
-        "align": "metric_scale",
+        "align": "moge",
         "depth": "moge",
         "views": view_records,
     }

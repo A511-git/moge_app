@@ -526,11 +526,11 @@ def test_fuse_cameras_auto_scales_moge_depth() -> None:
     assert report["depth"] == "moge"
     assert report["metric_scale"] == 5.0
     assert [view["name"] for view in report["views"]] == ["far", "near"]
-    assert report["align"] == "metric_scale"
-    assert report["views"][0]["scale"] == 5.0
+    assert report["align"] == "moge"
+    assert report["views"][0]["scale"] == 1.0
     assert report["views"][0]["fx"] == 8.0
     assert abs(report["baseline_m"] - 1.0) < 1e-6
-    assert abs(report["views"][0]["median_depth_m"] - 10.0) < 1e-6
+    assert abs(report["views"][0]["median_depth_m"] - 2.0) < 1e-6
 
 
 def test_single_face_cameras_auto_ingest() -> None:
