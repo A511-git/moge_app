@@ -114,22 +114,17 @@ class ScaleResult:
 class CamerasAutoView:
     """One camera from ``cameras_auto.json``.
 
-    ``metric_scale`` is the shared model output. Poses are already in meters in
-    ``world_frame`` (view-0 world for the auto export), so depth is unprojected
-    with ``s = Z`` and is not multiplied by ``metric_scale`` again.
+    MoGe predicts the depth. This record supplies the photo intrinsics, the
+    OpenCV RDF extrinsics, and the shared ``metric_scale`` applied to those
+    camera-space points. Any ``depth`` path in the JSON is ignored.
     """
 
     image_name: str
     scene: str
-    frame_index: int
     metric_scale: float
-    intrinsics_network: CameraIntrinsics
     intrinsics_image: CameraIntrinsics
-    position: np.ndarray
     camera_to_world: np.ndarray
-    world_to_camera: np.ndarray
     image_path: Path
-    depth_path: Path
     source_path: Path
 
     @property
@@ -140,24 +135,6 @@ class CamerasAutoView:
     def origin(self) -> np.ndarray:
         return np.asarray(self.camera_to_world[:3, 3], dtype=np.float64).copy()
 
-    def intrinsics_for_depth(self, depth: np.ndarray) -> Tuple[CameraIntrinsics, str]:
-        """Pick network or photo K by the depth map's width and height."""
-        depth_map = np.asarray(depth)
-        if depth_map.ndim != 2:
-            raise ValueError(f"{self.name}: depth must be HxW, got {depth_map.shape}")
-        height, width = int(depth_map.shape[0]), int(depth_map.shape[1])
-        network = self.intrinsics_network
-        photo = self.intrinsics_image
-        if width == network.width and height == network.height:
-            return network, "network"
-        if width == photo.width and height == photo.height:
-            return photo, "image"
-        raise ValueError(
-            f"{self.name}: depth {width}x{height} matches neither "
-            f"network {network.width}x{network.height} nor "
-            f"image {photo.width}x{photo.height}"
-        )
-
 
 @dataclass
 class CamerasAuto:
@@ -167,7 +144,6 @@ class CamerasAuto:
     camera_axes: str
     units: str
     matrix_order: str
-    projection: str
     max_depth_m: float
     metric_scale: float
     views: List[CamerasAutoView]
@@ -361,11 +337,10 @@ def _resolve_sibling(root: Path, raw: object, label: str) -> Path:
 def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
     """Ingest ``cameras_auto.json``.
 
-    Geometry used per camera: image path, scene, frame index, both intrinsics
-    blocks, ``cameraToWorld`` / ``worldToCamera``, and the depth path. ``position``
-    is checked against the pose translation and is not a second pose.
-    ``metricScale`` must be the same on every camera. ``comment`` and
-    ``source.mode`` / ``poseMap`` / ``input`` are not read.
+    Geometry used per camera: image name, scene, ``intrinsicsImage``,
+    ``cameraToWorld``, and ``metricScale``. ``metricScale`` must be shared.
+    ``frameIndex``, ``intrinsicsNetwork``, ``worldToCamera``, ``position``,
+    and any ``depth`` path are ignored. MoGe predicts depth.
     """
     json_path = Path(path)
     with json_path.open("r", encoding="utf-8") as handle:
@@ -386,7 +361,6 @@ def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
     if units != "meters":
         raise ValueError(f"{json_path} units must be meters, got {units!r}")
     world_frame = str(convention.get("frame") or "")
-    projection = str(convention.get("projection") or "")
 
     source = document.get("source")
     if not isinstance(source, dict) or "maxDepthMeters" not in source:
@@ -411,66 +385,29 @@ def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
             raise ValueError(f"{label} is missing image")
         if not isinstance(scene, str) or not scene:
             raise ValueError(f"{label} is missing scene")
-        try:
-            frame_index = int(camera["frameIndex"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{label} is missing frameIndex") from exc
 
         metric_scale = _finite_float(camera.get("metricScale"), f"{label}.metricScale")
         if metric_scale <= 0:
             raise ValueError(f"{label}.metricScale must be positive")
 
-        network_size = _size_pair(camera.get("networkImage"), f"{label}.networkImage")
         photo_size = _size_pair(camera.get("originalImage"), f"{label}.originalImage")
-        intrinsics_network = _parse_intrinsics_block(camera.get("intrinsicsNetwork"), f"{label}.intrinsicsNetwork")
         intrinsics_image = _parse_intrinsics_block(camera.get("intrinsicsImage"), f"{label}.intrinsicsImage")
-        if (intrinsics_network.width, intrinsics_network.height) != network_size:
-            raise ValueError(f"{label} intrinsicsNetwork size != networkImage")
         if (intrinsics_image.width, intrinsics_image.height) != photo_size:
             raise ValueError(f"{label} intrinsicsImage size != originalImage")
 
         try:
             camera_to_world = matrix_from_column_major(camera["cameraToWorld"])
-            world_to_camera = matrix_from_column_major(camera["worldToCamera"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{label} is missing a 4x4 pose") from exc
-        inverse_error = np.linalg.norm(camera_to_world @ world_to_camera - np.eye(4))
-        if inverse_error > 1e-3:
-            raise ValueError(
-                f"{label} cameraToWorld and worldToCamera disagree (error {inverse_error:.3e})"
-            )
-
-        position_json = camera.get("position")
-        if not isinstance(position_json, dict):
-            raise ValueError(f"{label} is missing position")
-        try:
-            position = np.array(
-                [
-                    _finite_float(position_json["x"], f"{label}.position.x"),
-                    _finite_float(position_json["y"], f"{label}.position.y"),
-                    _finite_float(position_json["z"], f"{label}.position.z"),
-                ],
-                dtype=np.float64,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{label}.position must have x/y/z") from exc
-        origin = camera_to_world[:3, 3]
-        if not np.allclose(position, origin, rtol=0.0, atol=1e-4):
-            raise ValueError(f"{label}.position does not match cameraToWorld translation")
+            raise ValueError(f"{label} is missing a 4x4 cameraToWorld") from exc
 
         views.append(
             CamerasAutoView(
                 image_name=image_name,
                 scene=scene,
-                frame_index=frame_index,
                 metric_scale=metric_scale,
-                intrinsics_network=intrinsics_network,
                 intrinsics_image=intrinsics_image,
-                position=position,
                 camera_to_world=camera_to_world,
-                world_to_camera=world_to_camera,
                 image_path=_resolve_sibling(root, image_name, f"{label}.image"),
-                depth_path=_resolve_sibling(root, camera.get("depth"), f"{label}.depth"),
                 source_path=json_path,
             )
         )
@@ -484,7 +421,6 @@ def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
         camera_axes=str(camera_axes),
         units=str(units),
         matrix_order=str(matrix_order),
-        projection=projection,
         max_depth_m=max_depth_m,
         metric_scale=float(scales[0]),
         views=views,
@@ -492,58 +428,43 @@ def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
     )
 
 
-def depth_valid_mask(
-    depth: np.ndarray,
-    depth_min: float = DEPTH_MIN_M,
-    depth_max: float = DEPTH_MAX_M,
-) -> np.ndarray:
-    """Finite depths inside ``[depth_min, depth_max]``."""
-    depth_map = np.asarray(depth, dtype=np.float64)
-    if depth_map.ndim != 2:
-        raise ValueError(f"depth must be HxW, got {depth_map.shape}")
-    return np.isfinite(depth_map) & (depth_map >= depth_min) & (depth_map <= depth_max)
+def match_cameras_to_images(document: CamerasAuto) -> Tuple[List[CamerasAutoView], List[str]]:
+    """Match image files next to the JSON to camera entries by filename.
 
-
-def place_auto_view(
-    view: CamerasAutoView,
-    depth: np.ndarray,
-    colors: np.ndarray,
-    depth_max: float,
-    depth_min: float = DEPTH_MIN_M,
-) -> Tuple[np.ndarray, np.ndarray, CameraIntrinsics, str, float]:
-    """Unproject one ingested depth map with ``s = Z`` and its ``cameraToWorld``.
-
-    ``metric_scale`` is not applied. The depth values are already the Z the
-    JSON projection equation uses, in the same meters as the pose.
+    An image with no camera entry is skipped. A camera whose image file is
+    not in that folder is skipped too.
     """
-    depth_map = np.asarray(depth, dtype=np.float64)
-    intrinsics, which = view.intrinsics_for_depth(depth_map)
-    color_map = np.asarray(colors)
-    if color_map.ndim != 3 or color_map.shape[2] != 3:
-        raise ValueError(f"{view.name}: colors must be HxWx3, got {color_map.shape}")
-    if color_map.shape[:2] != depth_map.shape[:2]:
-        raise ValueError(
-            f"{view.name}: colors {color_map.shape[:2]} != depth {depth_map.shape[:2]}"
+    folder = document.path.parent
+    by_name: Dict[str, CamerasAutoView] = {}
+    for view in document.views:
+        key = Path(view.image_name).name
+        if key in by_name:
+            raise ValueError(f"{document.path} lists {key} more than once")
+        by_name[key] = view
+
+    images = [
+        path for path in sorted(folder.iterdir())
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTS
+    ]
+    matched: List[CamerasAutoView] = []
+    skipped: List[str] = []
+    seen = set()
+    for image in images:
+        view = by_name.get(image.name)
+        if view is None:
+            skipped.append(image.name)
+            continue
+        view.image_path = image
+        matched.append(view)
+        seen.add(image.name)
+    for name in by_name:
+        if name not in seen:
+            skipped.append(name)
+    if not matched:
+        raise FileNotFoundError(
+            f"No image next to {document.path} has a cameras_auto entry. Skipped {skipped}."
         )
-    valid = depth_valid_mask(depth_map, depth_min=depth_min, depth_max=depth_max)
-    median_depth = median_valid_depth(depth_map, valid, depth_min=depth_min, depth_max=depth_max)
-    if not np.any(valid):
-        return (
-            np.zeros((0, 3), dtype=np.float64),
-            np.zeros((0, 3), dtype=np.uint8),
-            intrinsics,
-            which,
-            median_depth,
-        )
-    rows, cols = np.nonzero(valid)
-    points = unproject_pixels(
-        cols.astype(np.float64),
-        rows.astype(np.float64),
-        depth_map[valid],
-        intrinsics,
-        view.camera_to_world,
-    )
-    return points, np.asarray(color_map[valid], dtype=np.uint8), intrinsics, which, median_depth
+    return matched, skipped
 
 
 def camera_points_to_world(points_cam: np.ndarray, camera_to_world: np.ndarray) -> np.ndarray:

@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """Fuse posed perspective photos into one world point cloud.
 
-Two inputs:
-
-* ``--input`` / ``--image`` + ``--poses``: ARKit pose JSON. MoGe runs at the
-  horizontal FOV implied by those intrinsics, then an overlap scale is solved.
-* ``--cameras``: ``cameras_auto.json``. Depth, model K, view-0 poses, and the
-  shared ``metricScale`` are ingested. Points are unprojected with ``s = Z``
-  and placed with ``cameraToWorld``. No second per-view scale is solved.
+``cameras_auto.json`` supplies each photo's intrinsics, ``cameraToWorld``, and
+``metricScale``. MoGe predicts the depth. That scale is applied to the points,
+then ``cameraToWorld`` places them.
 
 This is not the panorama path: cameras are translated, and ``merge_panorama_depth``
 is not used.
@@ -19,7 +15,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 _parent_dir = str(Path(__file__).resolve().parent.parent)
 if _parent_dir not in sys.path:
@@ -38,15 +34,9 @@ try:
         DEPTH_MAX_M,
         DEPTH_MIN_M,
         CamerasAuto,
-        PerspectiveFrame,
-        ScaleResult,
-        choose_reference_index,
-        discover_perspective_pairs,
-        estimate_scale,
         load_cameras_auto,
-        load_perspective_frame,
+        match_cameras_to_images,
         median_valid_depth,
-        place_auto_view,
     )
 except ImportError:
     from .model import MoGeModel
@@ -56,15 +46,9 @@ except ImportError:
         DEPTH_MAX_M,
         DEPTH_MIN_M,
         CamerasAuto,
-        PerspectiveFrame,
-        ScaleResult,
-        choose_reference_index,
-        discover_perspective_pairs,
-        estimate_scale,
         load_cameras_auto,
-        load_perspective_frame,
+        match_cameras_to_images,
         median_valid_depth,
-        place_auto_view,
     )
 
 
@@ -80,24 +64,6 @@ SOURCE_TINTS = np.array(
     ],
     dtype=np.uint8,
 )
-
-
-def _resolve_inputs(
-    input_path: Optional[str],
-    images: Sequence[str],
-    poses: Sequence[str],
-) -> List[Tuple[Path, Path]]:
-    if input_path and (images or poses):
-        raise click.UsageError("Pass either --input or --image/--poses, not both.")
-    if input_path:
-        return discover_perspective_pairs(input_path)
-    if len(images) == 0 and len(poses) == 0:
-        raise click.UsageError("Pass --input or at least one --image/--poses pair.")
-    if len(images) != len(poses):
-        raise click.UsageError(
-            f"--image ({len(images)}) and --poses ({len(poses)}) must be paired one to one."
-        )
-    return [(Path(image), Path(pose)) for image, pose in zip(images, poses)]
 
 
 def _load_rgb(image_path: Path, resize_to: Optional[int]) -> Tuple[np.ndarray, int, int]:
@@ -149,9 +115,14 @@ def _infer_maps(
     return points, depth, mask_bool
 
 
-def _valid_pixels(points: np.ndarray, depth: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def _valid_pixels(
+    points: np.ndarray,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    depth_max: float = DEPTH_MAX_M,
+) -> np.ndarray:
     finite = np.isfinite(points).all(axis=-1) & np.isfinite(depth)
-    return mask & finite & (depth >= DEPTH_MIN_M) & (depth <= DEPTH_MAX_M)
+    return mask & finite & (depth >= DEPTH_MIN_M) & (depth <= depth_max)
 
 
 def _cloud_from_view(
@@ -182,69 +153,12 @@ def _json_float(value: Optional[float]) -> Optional[float]:
     return number
 
 
-def _view_record(
-    frame: PerspectiveFrame,
-    median_depth: float,
-    *,
-    is_reference: bool,
-    applied_scale: float,
-    result: Optional[ScaleResult],
-    baseline_to_reference_m: Optional[float],
-) -> dict:
-    record = {
-        "name": frame.name,
-        "image": str(frame.image_path) if frame.image_path is not None else None,
-        "poses": str(frame.poses_path) if frame.poses_path is not None else None,
-        "origin": [float(v) for v in frame.origin],
-        "fov_x_deg": float(frame.intrinsics.fov_x_deg),
-        "fov_y_deg": float(frame.intrinsics.fov_y_deg),
-        "median_depth_m": _json_float(median_depth),
-        "is_reference": is_reference,
-        "scale": float(applied_scale),
-        "estimated_scale": 1.0 if result is None else float(result.estimated_scale),
-        "inlier_count": 0 if result is None else int(result.inlier_count),
-        "residual_before_m": None if result is None else _json_float(result.residual_before_m),
-        "residual_after_m": None if result is None else _json_float(result.residual_after_m),
-        "naive_depth_ratio": None if result is None else _json_float(result.naive_depth_ratio),
-        "sufficient_overlap": True if result is None else bool(result.sufficient_overlap),
-        "baseline_to_reference_m": _json_float(baseline_to_reference_m),
-    }
-    return record
-
-
-def _load_depth_map(path: Path) -> np.ndarray:
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Depth map not found: {path}. cameras_auto.json points at this file "
-            "(usually depths/<image>_depth.npy next to the JSON)."
-        )
-    depth = np.load(path)
-    depth = np.asarray(depth)
-    if depth.ndim == 3 and depth.shape[-1] == 1:
-        depth = depth[..., 0]
-    elif depth.ndim == 3 and depth.shape[0] == 1:
-        depth = depth[0]
-    if depth.ndim != 2:
-        raise ValueError(f"{path} depth must be HxW, got {tuple(depth.shape)}")
-    return np.asarray(depth, dtype=np.float64)
-
-
-def _colors_for_depth(image_path: Path, height: int, width: int) -> np.ndarray:
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-    bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise FileNotFoundError(f"Unreadable image: {image_path}")
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    if rgb.shape[0] != height or rgb.shape[1] != width:
-        rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
-    return rgb
-
-
 def _write_clouds(
     out_dir: Path,
-    tint_points: List[np.ndarray],
-    tint_colors: List[np.ndarray],
+    unaligned_points: List[np.ndarray],
+    unaligned_colors: List[np.ndarray],
+    aligned_points: List[np.ndarray],
+    aligned_colors: List[np.ndarray],
     rgb_points: List[np.ndarray],
     rgb_colors: List[np.ndarray],
     voxel_size: float,
@@ -256,13 +170,13 @@ def _write_clouds(
 
     write_rgb_ply(
         out_dir / "unaligned_by_source.ply",
-        _concat(tint_points, 3, np.float32),
-        _concat(tint_colors, 3, np.uint8),
+        _concat(unaligned_points, 3, np.float32),
+        _concat(unaligned_colors, 3, np.uint8),
     )
     write_rgb_ply(
         out_dir / "aligned_by_source.ply",
-        _concat(tint_points, 3, np.float32),
-        _concat(tint_colors, 3, np.uint8),
+        _concat(aligned_points, 3, np.float32),
+        _concat(aligned_colors, 3, np.uint8),
     )
     rgb_pts = _concat(rgb_points, 3, np.float32)
     rgb_cols = _concat(rgb_colors, 3, np.uint8)
@@ -275,50 +189,84 @@ def _write_clouds(
 def fuse_cameras_auto(
     cameras_path: Path,
     output_path: Path,
-    frame_index: int,
     voxel_size: float,
+    model: MoGeModel,
+    device: torch.device,
+    resolution_level: int,
+    num_tokens: Optional[int],
+    refine_steps: int,
+    use_fp16: bool,
+    resize_to: Optional[int],
 ) -> dict:
-    """Place every ingested camera. Depth is Z in meters; metricScale is not reapplied."""
+    """Run MoGe on each photo that has a cameras_auto entry, matched by filename."""
     document: CamerasAuto = load_cameras_auto(cameras_path)
-    views = [view for view in document.views if view.frame_index == int(frame_index)]
-    if not views:
-        found = sorted({view.frame_index for view in document.views})
-        raise click.UsageError(
-            f"No cameras with frameIndex {frame_index} in {cameras_path}. Found {found}."
-        )
+    views, skipped = match_cameras_to_images(document)
+    for name in skipped:
+        print(f"[posed] skip {name}: no cameras_auto entry for that image, or the image file is missing")
 
     print(
         f"[posed] cameras_auto {document.world_frame}: {len(views)} views, "
         f"shared metricScale {document.metric_scale:.6f}, "
         f"max depth {document.max_depth_m:.1f} m"
     )
-    print("[posed] Depth unprojected with s=Z. metricScale is not applied a second time.")
+    print("[posed] MoGe predicts depth. JSON intrinsics set FOV, cameraToWorld places points, metricScale scales them.")
 
-    tint_points: List[np.ndarray] = []
-    tint_colors: List[np.ndarray] = []
+    unaligned_points: List[np.ndarray] = []
+    unaligned_colors: List[np.ndarray] = []
+    aligned_points: List[np.ndarray] = []
+    aligned_colors: List[np.ndarray] = []
     rgb_points: List[np.ndarray] = []
     rgb_colors: List[np.ndarray] = []
     view_records = []
 
     for index, view in enumerate(views):
-        depth = _load_depth_map(view.depth_path)
-        colors = _colors_for_depth(view.image_path, depth.shape[0], depth.shape[1])
-        points, point_colors, intrinsics, which, median_depth = place_auto_view(
-            view,
-            depth,
-            colors,
+        rgb, orig_width, orig_height = _load_rgb(view.image_path, resize_to)
+        photo = view.intrinsics_image
+        if photo.width != orig_width or photo.height != orig_height:
+            raise ValueError(
+                f"{view.name}: intrinsicsImage is {photo.width}x{photo.height}, "
+                f"image is {orig_width}x{orig_height}"
+            )
+        print(
+            f"[posed] {view.name}: fov_x={photo.fov_x_deg:.2f} deg, "
+            f"metricScale={view.metric_scale:.4f}, "
+            f"origin={np.round(view.origin, 3).tolist()}, infer {rgb.shape[1]}x{rgb.shape[0]}"
+        )
+        points, depth, mask = _infer_maps(
+            model,
+            rgb,
+            photo.fov_x_deg,
+            device,
+            resolution_level,
+            num_tokens,
+            refine_steps,
+            use_fp16,
+        )
+        if depth.shape[:2] != rgb.shape[:2]:
+            raise RuntimeError(
+                f"{view.name}: MoGe depth {depth.shape} != image {rgb.shape[0]}x{rgb.shape[1]}"
+            )
+        scaled_depth = np.asarray(depth, dtype=np.float64) * float(view.metric_scale)
+        valid = _valid_pixels(points, scaled_depth, mask, depth_max=document.max_depth_m)
+        world_raw, _ = _cloud_from_view(points, rgb, valid, view.camera_to_world, 1.0)
+        world_scaled, point_colors = _cloud_from_view(
+            points, rgb, valid, view.camera_to_world, view.metric_scale
+        )
+        median_depth = median_valid_depth(
+            scaled_depth,
+            valid,
             depth_max=document.max_depth_m,
         )
         print(
-            f"[posed] {view.name}: K={which} {intrinsics.width}x{intrinsics.height}, "
-            f"fov_x={intrinsics.fov_x_deg:.2f} deg, "
-            f"origin={np.round(view.origin, 3).tolist()}, "
-            f"median depth {median_depth:.3f} m, points {len(points)}"
+            f"[posed] {view.name}: median scaled depth {median_depth:.3f} m, points {len(world_scaled)}"
         )
-        if len(points):
-            tint_points.append(points.astype(np.float32))
-            tint_colors.append(_tint(len(points), index))
-            rgb_points.append(points.astype(np.float32))
+        if len(world_raw):
+            unaligned_points.append(world_raw.astype(np.float32))
+            unaligned_colors.append(_tint(len(world_raw), index))
+        if len(world_scaled):
+            aligned_points.append(world_scaled.astype(np.float32))
+            aligned_colors.append(_tint(len(world_scaled), index))
+            rgb_points.append(world_scaled.astype(np.float32))
             rgb_colors.append(point_colors)
 
         view_records.append(
@@ -326,28 +274,31 @@ def fuse_cameras_auto(
                 "name": view.name,
                 "scene": view.scene,
                 "image": str(view.image_path),
-                "depth": str(view.depth_path),
-                "frame_index": int(view.frame_index),
-                "intrinsics": which,
-                "fov_x_deg": float(intrinsics.fov_x_deg),
-                "fov_y_deg": float(intrinsics.fov_y_deg),
-                "fx": float(intrinsics.fx),
-                "fy": float(intrinsics.fy),
-                "cx": float(intrinsics.cx),
-                "cy": float(intrinsics.cy),
-                "width": int(intrinsics.width),
-                "height": int(intrinsics.height),
+                "fov_x_deg": float(photo.fov_x_deg),
+                "fov_y_deg": float(photo.fov_y_deg),
+                "fx": float(photo.fx),
+                "fy": float(photo.fy),
+                "cx": float(photo.cx),
+                "cy": float(photo.cy),
+                "width": int(photo.width),
+                "height": int(photo.height),
                 "origin": [float(v) for v in view.origin],
-                "position": [float(v) for v in view.position],
                 "metric_scale": float(view.metric_scale),
                 "median_depth_m": _json_float(median_depth),
-                "scale": 1.0,
+                "scale": float(view.metric_scale),
             }
         )
 
     output_path.mkdir(parents=True, exist_ok=True)
     rgb_pts, _rgb_cols = _write_clouds(
-        output_path, tint_points, tint_colors, rgb_points, rgb_colors, voxel_size
+        output_path,
+        unaligned_points,
+        unaligned_colors,
+        aligned_points,
+        aligned_colors,
+        rgb_points,
+        rgb_colors,
+        voxel_size,
     )
 
     report = {
@@ -356,11 +307,10 @@ def fuse_cameras_auto(
         "world": document.world_frame,
         "camera_axes": document.camera_axes,
         "units": document.units,
-        "projection": document.projection,
         "max_depth_m": float(document.max_depth_m),
         "metric_scale": float(document.metric_scale),
-        "align": "shared_metric_scale",
-        "frame_index": int(frame_index),
+        "align": "metric_scale",
+        "depth": "moge",
         "views": view_records,
     }
     if len(views) == 2:
@@ -379,14 +329,7 @@ def fuse_cameras_auto(
 
 
 @click.command(help="Fuse posed perspective images into one world point cloud.")
-@click.option("--input", "-i", "input_path", type=click.Path(exists=True, file_okay=False), default=None, help="Folder of images plus *_poses_world_opencv_rdf.json.")
-@click.option("--cameras", "cameras_path", type=click.Path(exists=True, dir_okay=False), default=None, help="cameras_auto.json. Uses its depth, K, view-0 poses, and shared metricScale.")
-@click.option("--image", "images", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Perspective image. Repeat, paired in order with --poses.")
-@click.option("--poses", "poses", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Pose JSON for the matching --image.")
-@click.option("--frame-index", default=11, show_default=True, type=int, help="Frame index inside each pose JSON.")
-@click.option("--align", type=click.Choice(["none", "median_depth_ratio", "plane"]), default="median_depth_ratio", show_default=True)
-@click.option("--reference", "reference_index", type=int, default=None, help="View index to lock as metric. Default: smallest median depth.")
-@click.option("--stride", default=8, show_default=True, type=int, help="Pixel stride used while estimating overlap scale.")
+@click.option("--cameras", "cameras_path", required=True, type=click.Path(exists=True, dir_okay=False), help="cameras_auto.json. MoGe predicts depth; JSON supplies K, poses, and metricScale.")
 @click.option("--voxel-size", default=0.0, show_default=True, type=float, help="Voxel size in meters for aligned_rgb.ply. 0 keeps every point.")
 @click.option("--output", "-o", "output_path", type=click.Path(), default="./output_posed", show_default=True)
 @click.option("--model", "-m", "model_name", type=click.Choice(["vitl", "vitg", "moge-3-vitl", "moge-3-vitg"]), default="vitl", show_default=True)
@@ -399,14 +342,7 @@ def fuse_cameras_auto(
 @click.option("--num_tokens", type=int, default=None)
 @click.option("--refine_steps", type=int, default=3, show_default=True)
 def main(
-    input_path: Optional[str],
-    cameras_path: Optional[str],
-    images: Tuple[str, ...],
-    poses: Tuple[str, ...],
-    frame_index: int,
-    align: str,
-    reference_index: Optional[int],
-    stride: int,
+    cameras_path: str,
     voxel_size: float,
     output_path: str,
     model_name: str,
@@ -421,18 +357,9 @@ def main(
 ) -> None:
     if not (0 <= resolution_level <= 9):
         raise click.BadParameter("resolution_level must be between 0 and 9")
-    if stride < 1:
-        raise click.BadParameter("stride must be >= 1")
     if voxel_size < 0:
         raise click.BadParameter("voxel-size must be >= 0")
 
-    if cameras_path is not None:
-        if input_path or images or poses:
-            raise click.UsageError("Pass --cameras alone, not with --input or --image/--poses.")
-        fuse_cameras_auto(Path(cameras_path), Path(output_path), frame_index, voxel_size)
-        return
-
-    pairs = _resolve_inputs(input_path, images, poses)
     if device_name.startswith("cuda") and torch.cuda.is_available():
         device = torch.device(device_name)
     else:
@@ -456,196 +383,18 @@ def main(
 
     print(f"[posed] Loading MoGe-3 ({model_key}, {model_params}) from '{pretrained_model_name_or_path}' on {device}")
     model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
-
-    inferred: List[dict] = []
-    for image_path, poses_path in pairs:
-        rgb, orig_width, orig_height = _load_rgb(image_path, resize_to)
-        frame = load_perspective_frame(
-            poses_path,
-            frame_index,
-            orig_width,
-            orig_height,
-            image_path=image_path,
-            name=image_path.stem,
-        )
-        intrinsics_infer = frame.intrinsics.scaled_to(rgb.shape[1], rgb.shape[0])
-        print(
-            f"[posed] {frame.name}: fov_x={frame.intrinsics.fov_x_deg:.2f} deg, "
-            f"origin={np.round(frame.origin, 3).tolist()}, infer {rgb.shape[1]}x{rgb.shape[0]}"
-        )
-        points, depth, mask = _infer_maps(
-            model,
-            rgb,
-            frame.intrinsics.fov_x_deg,
-            device,
-            resolution_level,
-            num_tokens,
-            refine_steps,
-            use_fp16,
-        )
-        if depth.shape[:2] != (intrinsics_infer.height, intrinsics_infer.width):
-            raise RuntimeError(
-                f"{frame.name}: MoGe depth {depth.shape} != image {intrinsics_infer.height}x{intrinsics_infer.width}"
-            )
-        inferred.append(
-            {
-                "frame": frame,
-                "intrinsics": intrinsics_infer,
-                "points": points,
-                "depth": depth,
-                "mask": mask,
-                "colors": rgb,
-                "median_depth": median_valid_depth(depth, mask),
-            }
-        )
-
-    reference = choose_reference_index(
-        [item["median_depth"] for item in inferred],
-        override=reference_index,
+    fuse_cameras_auto(
+        Path(cameras_path),
+        Path(output_path),
+        voxel_size,
+        model,
+        device,
+        resolution_level,
+        num_tokens,
+        refine_steps,
+        use_fp16,
+        resize_to,
     )
-    ref_item = inferred[reference]
-    ref_frame: PerspectiveFrame = ref_item["frame"]
-    print(
-        f"[posed] Reference view {reference} ({ref_frame.name}), "
-        f"median depth {ref_item['median_depth']:.3f} m, align={align}"
-    )
-
-    align_method = "median_depth_ratio" if align == "none" else align
-    applied_scales = [1.0] * len(inferred)
-    results: List[Optional[ScaleResult]] = [None] * len(inferred)
-    for index, item in enumerate(inferred):
-        if index == reference:
-            continue
-        src_frame: PerspectiveFrame = item["frame"]
-        result = estimate_scale(
-            ref_item["depth"],
-            ref_item["mask"],
-            ref_item["intrinsics"],
-            ref_frame.camera_to_world,
-            ref_frame.world_to_camera,
-            item["depth"],
-            item["mask"],
-            item["intrinsics"],
-            src_frame.camera_to_world,
-            src_frame.world_to_camera,
-            method=align_method,
-            stride=stride,
-        )
-        results[index] = result
-        if not result.sufficient_overlap:
-            print(f"[posed] WARNING {src_frame.name}: overlap too small ({result.inlier_count} inliers). Scale left at 1.")
-            applied_scales[index] = 1.0
-        elif align == "none":
-            applied_scales[index] = 1.0
-            print(
-                f"[posed] {src_frame.name}: align=none, estimated scale {result.estimated_scale:.4f} not applied. "
-                f"depth residual {result.residual_before_m} m"
-            )
-        else:
-            applied_scales[index] = result.scale
-            print(
-                f"[posed] {src_frame.name}: scale {result.scale:.4f} "
-                f"({result.inlier_count} inliers), "
-                f"depth residual {result.residual_before_m:.4f} m -> {result.residual_after_m:.4f} m"
-            )
-
-    unaligned_points: List[np.ndarray] = []
-    unaligned_colors: List[np.ndarray] = []
-    aligned_tint_points: List[np.ndarray] = []
-    aligned_tint_colors: List[np.ndarray] = []
-    aligned_rgb_points: List[np.ndarray] = []
-    aligned_rgb_colors: List[np.ndarray] = []
-
-    for index, item in enumerate(inferred):
-        frame = item["frame"]
-        valid = _valid_pixels(item["points"], item["depth"], item["mask"])
-        world_unscaled, _ = _cloud_from_view(
-            item["points"], item["colors"], valid, frame.camera_to_world, 1.0
-        )
-        world_scaled, rgb_colors = _cloud_from_view(
-            item["points"], item["colors"], valid, frame.camera_to_world, applied_scales[index]
-        )
-        if len(world_unscaled):
-            unaligned_points.append(world_unscaled)
-            unaligned_colors.append(_tint(len(world_unscaled), index))
-        if len(world_scaled):
-            aligned_tint_points.append(world_scaled)
-            aligned_tint_colors.append(_tint(len(world_scaled), index))
-            aligned_rgb_points.append(world_scaled)
-            aligned_rgb_colors.append(rgb_colors)
-
-    def _concat(chunks: List[np.ndarray], width: int, dtype) -> np.ndarray:
-        if not chunks:
-            return np.zeros((0, width), dtype=dtype)
-        return np.concatenate(chunks, axis=0)
-
-    out_dir = Path(output_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_rgb_ply(
-        out_dir / "unaligned_by_source.ply",
-        _concat(unaligned_points, 3, np.float32),
-        _concat(unaligned_colors, 3, np.uint8),
-    )
-    write_rgb_ply(
-        out_dir / "aligned_by_source.ply",
-        _concat(aligned_tint_points, 3, np.float32),
-        _concat(aligned_tint_colors, 3, np.uint8),
-    )
-    rgb_pts = _concat(aligned_rgb_points, 3, np.float32)
-    rgb_cols = _concat(aligned_rgb_colors, 3, np.uint8)
-    if voxel_size > 0.0:
-        rgb_pts, rgb_cols = voxel_downsample_points(rgb_pts, rgb_cols, voxel_size)
-    write_rgb_ply(out_dir / "aligned_rgb.ply", rgb_pts, rgb_cols)
-
-    ref_origin = ref_frame.origin
-    view_records = []
-    for index, item in enumerate(inferred):
-        frame = item["frame"]
-        result = results[index]
-        if align == "none" and result is not None:
-            # Scale was not applied, so the after-residual matches the unscaled cloud.
-            result = ScaleResult(
-                scale=1.0,
-                estimated_scale=result.estimated_scale,
-                inlier_count=result.inlier_count,
-                residual_before_m=result.residual_before_m,
-                residual_after_m=result.residual_before_m,
-                naive_depth_ratio=result.naive_depth_ratio,
-                sufficient_overlap=result.sufficient_overlap,
-            )
-        baseline = None if index == reference else float(np.linalg.norm(frame.origin - ref_origin))
-        view_records.append(
-            _view_record(
-                frame,
-                item["median_depth"],
-                is_reference=(index == reference),
-                applied_scale=applied_scales[index],
-                result=result,
-                baseline_to_reference_m=baseline,
-            )
-        )
-
-    report = {
-        "align": align,
-        "frame_index": int(frame_index),
-        "reference_index": int(reference),
-        "reference_name": ref_frame.name,
-        "world": "arkit",
-        "views": view_records,
-    }
-    if len(inferred) == 2:
-        origins = [item["frame"].origin for item in inferred]
-        report["baseline_m"] = float(np.linalg.norm(origins[0] - origins[1]))
-
-    scales_path = out_dir / "scales.json"
-    with scales_path.open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2)
-        handle.write("\n")
-
-    print(f"[posed] Wrote {out_dir / 'unaligned_by_source.ply'}")
-    print(f"[posed] Wrote {out_dir / 'aligned_by_source.ply'}")
-    print(f"[posed] Wrote {out_dir / 'aligned_rgb.ply'} ({len(rgb_pts)} points)")
-    print(f"[posed] Wrote {scales_path}")
 
 
 if __name__ == "__main__":

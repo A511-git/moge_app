@@ -20,7 +20,6 @@ from standalone_moge.utils.posed_perspectives import (
     matrix_from_column_major,
     naive_depth_ratio,
     per_point_scale,
-    place_auto_view,
     scale_world_about_camera,
     unproject_pixels,
 )
@@ -414,16 +413,21 @@ def _write_cameras_auto(folder: Path, cameras) -> Path:
     return path
 
 
-def test_cameras_auto_unprojects_depth_without_reapplying_metric_scale() -> None:
+def test_cameras_auto_loads_without_depth_files() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         folder = Path(tmp)
-        path = _write_cameras_auto(
-            folder,
-            [
-                _auto_camera("near", "nearScene", [0.0, 0.0, 0.0], metric_scale=5.25),
-                _auto_camera("far", "farScene", [0.0, 0.0, 3.0], metric_scale=5.25),
-            ],
-        )
+        cameras = [
+            _auto_camera("near", "nearScene", [0.0, 0.0, 0.0], metric_scale=5.25),
+            _auto_camera("far", "farScene", [0.0, 0.0, 3.0], metric_scale=5.25),
+        ]
+        for camera in cameras:
+            camera.pop("depth")
+            camera.pop("frameIndex")
+            camera.pop("networkImage")
+            camera.pop("intrinsicsNetwork")
+            camera.pop("worldToCamera")
+            camera.pop("position")
+        path = _write_cameras_auto(folder, cameras)
         document = load_cameras_auto(path)
 
     assert document.world_frame == "view0World"
@@ -431,34 +435,9 @@ def test_cameras_auto_unprojects_depth_without_reapplying_metric_scale() -> None
     assert document.max_depth_m == 25.0
     assert [view.scene for view in document.views] == ["nearScene", "farScene"]
     assert np.allclose(document.views[1].origin, [0.0, 0.0, 3.0])
-
-    depth = np.full((2, 2), 2.0, dtype=np.float64)
-    colors = np.zeros((2, 2, 3), dtype=np.uint8)
-    colors[0, 0] = (10, 20, 30)
-    points, point_colors, intrinsics, which, median_depth = place_auto_view(
-        document.views[0],
-        depth,
-        colors,
-        depth_max=document.max_depth_m,
-    )
-    assert which == "network"
-    assert intrinsics.fx == 4.0
-    assert median_depth == 2.0
-    # Pixel (0, 0): x = (0 - 0.5) / 4 * 2. metricScale 5.25 must not stretch Z.
-    expected = np.array([-0.25, -0.25, 2.0])
-    match = np.where(np.all(np.isclose(points, expected, atol=1e-8), axis=1))[0]
-    assert len(match) == 1
-    assert tuple(point_colors[match[0]]) == (10, 20, 30)
-
-    photo_depth = np.full((4, 4), 2.0, dtype=np.float64)
-    _points, _colors, photo_k, photo_which, _median = place_auto_view(
-        document.views[0],
-        photo_depth,
-        np.zeros((4, 4, 3), dtype=np.uint8),
-        depth_max=25.0,
-    )
-    assert photo_which == "image"
-    assert photo_k.fx == 8.0
+    assert document.views[0].intrinsics_image.fx == 8.0
+    assert abs(document.views[0].intrinsics_image.fov_x_deg - (2.0 * np.degrees(np.arctan(4.0 / 16.0)))) < 1e-9
+    assert not hasattr(document.views[0], "depth_path")
 
 
 def test_cameras_auto_rejects_bad_convention_and_split_scales() -> None:
@@ -488,38 +467,67 @@ def test_cameras_auto_rejects_bad_convention_and_split_scales() -> None:
             raise AssertionError("wrong camera axes should fail")
 
 
-def test_fuse_cameras_auto_writes_world_cloud() -> None:
+def test_fuse_cameras_auto_scales_moge_depth() -> None:
+    import standalone_moge.infer_posed_perspectives as posed
+
     cv2 = __import__("cv2")
-    with tempfile.TemporaryDirectory() as tmp:
-        folder = Path(tmp)
-        path = _write_cameras_auto(
-            folder,
-            [
-                _auto_camera("near", "nearScene", [0.0, 0.0, 0.0]),
-                _auto_camera("far", "farScene", [1.0, 0.0, 0.0]),
-            ],
-        )
-        (folder / "depths").mkdir()
-        depth = np.full((2, 2), 2.0, dtype=np.float32)
-        np.save(folder / "depths" / "near_depth.npy", depth)
-        np.save(folder / "depths" / "far_depth.npy", depth)
-        image = np.zeros((4, 4, 3), dtype=np.uint8)
-        image[..., 0] = 255
-        cv2.imwrite(str(folder / "near.jpg"), image)
-        cv2.imwrite(str(folder / "far.jpg"), image)
-        out = folder / "out"
-        report = fuse_cameras_auto(path, out, frame_index=11, voxel_size=0.0)
-        assert (out / "aligned_rgb.ply").is_file()
-        assert (out / "unaligned_by_source.ply").is_file()
-        assert (out / "ingest.json").is_file()
+
+    def _fake_infer(model, rgb, fov_x_deg, device, resolution_level, num_tokens, refine_steps, use_fp16):
+        height, width = rgb.shape[:2]
+        depth = np.full((height, width), 2.0, dtype=np.float32)
+        points = np.zeros((height, width, 3), dtype=np.float32)
+        points[..., 2] = depth
+        mask = np.ones((height, width), dtype=bool)
+        return points, depth, mask
+
+    original = posed._infer_maps
+    posed._infer_maps = _fake_infer
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            path = _write_cameras_auto(
+                folder,
+                [
+                    _auto_camera("near", "nearScene", [0.0, 0.0, 0.0]),
+                    _auto_camera("far", "farScene", [1.0, 0.0, 0.0]),
+                ],
+            )
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["cameras"][1]["frameIndex"] = 0
+            path.write_text(json.dumps(document), encoding="utf-8")
+            image = np.zeros((4, 4, 3), dtype=np.uint8)
+            image[..., 0] = 255
+            cv2.imwrite(str(folder / "near.jpg"), image)
+            cv2.imwrite(str(folder / "far.jpg"), image)
+            cv2.imwrite(str(folder / "stray.jpg"), image)
+            out = folder / "out"
+            report = fuse_cameras_auto(
+                path,
+                out,
+                voxel_size=0.0,
+                model=None,
+                device=None,
+                resolution_level=5,
+                num_tokens=None,
+                refine_steps=0,
+                use_fp16=False,
+                resize_to=None,
+            )
+            assert (out / "aligned_rgb.ply").is_file()
+            assert (out / "unaligned_by_source.ply").is_file()
+            assert (out / "ingest.json").is_file()
+    finally:
+        posed._infer_maps = original
 
     assert report["world"] == "view0World"
+    assert report["depth"] == "moge"
     assert report["metric_scale"] == 5.0
-    assert report["align"] == "shared_metric_scale"
-    assert report["views"][0]["intrinsics"] == "network"
-    assert report["views"][0]["scale"] == 1.0
+    assert [view["name"] for view in report["views"]] == ["far", "near"]
+    assert report["align"] == "metric_scale"
+    assert report["views"][0]["scale"] == 5.0
+    assert report["views"][0]["fx"] == 8.0
     assert abs(report["baseline_m"] - 1.0) < 1e-6
-    assert report["views"][0]["median_depth_m"] == 2.0
+    assert abs(report["views"][0]["median_depth_m"] - 10.0) < 1e-6
 
 
 def test_single_face_cameras_auto_ingest() -> None:
@@ -538,22 +546,17 @@ def test_single_face_cameras_auto_ingest() -> None:
         "sAHiABwkaK_11.jpg",
     ]
     assert [view.scene for view in document.views] == ["9oPhlqgwrM", "sAHiABwkaK"]
-    assert all(view.frame_index == 11 for view in document.views)
     far, near = document.views
     assert np.allclose(
         far.origin,
         [-9.332343324786052e-05, -0.00086489028763026, -0.003577522002160549],
     )
     assert np.allclose(near.origin, [-0.25358846783638, -0.7677051424980164, 4.3514933586120605])
-    assert np.allclose(far.position, far.origin)
-    assert far.intrinsics_network.width == 392 and far.intrinsics_network.height == 518
     assert far.intrinsics_image.width == 1440 and far.intrinsics_image.height == 1920
     assert abs(far.intrinsics_image.fx - 1400.5274168635976) < 1e-6
-    assert abs(near.intrinsics_network.fx - 380.24462890625) < 1e-6
-    assert far.depth_path.name == "9oPhlqgwrM_11_depth.npy"
-    assert near.depth_path.name == "sAHiABwkaK_11_depth.npy"
+    assert abs(near.intrinsics_image.fx - 1396.816952833765) < 1e-6
     assert far.image_path.is_file()
-    assert not far.depth_path.is_file()
+    assert near.image_path.is_file()
 
 
 if __name__ == "__main__":
@@ -565,8 +568,8 @@ if __name__ == "__main__":
     test_floor_and_wall_scale_is_constant_naive_ratio_is_not()
     test_yawed_cameras_still_recover_scale()
     test_no_overlap_leaves_scale_at_one()
-    test_cameras_auto_unprojects_depth_without_reapplying_metric_scale()
+    test_cameras_auto_loads_without_depth_files()
     test_cameras_auto_rejects_bad_convention_and_split_scales()
-    test_fuse_cameras_auto_writes_world_cloud()
+    test_fuse_cameras_auto_scales_moge_depth()
     test_single_face_cameras_auto_ingest()
     print("ALL 12 TESTS PASSED")
