@@ -428,13 +428,18 @@ def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
     )
 
 
-def match_cameras_to_images(document: CamerasAuto) -> Tuple[List[CamerasAutoView], List[str]]:
-    """Match image files next to the JSON to camera entries by filename.
+def match_cameras_to_images(
+    document: CamerasAuto,
+    image_dir: Union[str, Path],
+) -> Tuple[List[CamerasAutoView], List[str]]:
+    """Match image files in ``image_dir`` to camera entries by filename.
 
     An image with no camera entry is skipped. A camera whose image file is
     not in that folder is skipped too.
     """
-    folder = document.path.parent
+    folder = Path(image_dir)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Image folder not found: {folder}")
     by_name: Dict[str, CamerasAutoView] = {}
     for view in document.views:
         key = Path(view.image_name).name
@@ -462,7 +467,7 @@ def match_cameras_to_images(document: CamerasAuto) -> Tuple[List[CamerasAutoView
             skipped.append(name)
     if not matched:
         raise FileNotFoundError(
-            f"No image next to {document.path} has a cameras_auto entry. Skipped {skipped}."
+            f"No image in {folder} has a cameras_auto entry. Skipped {skipped}."
         )
     return matched, skipped
 

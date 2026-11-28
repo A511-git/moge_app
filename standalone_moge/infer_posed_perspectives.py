@@ -188,6 +188,7 @@ def _write_clouds(
 
 def fuse_cameras_auto(
     cameras_path: Path,
+    image_dir: Path,
     output_path: Path,
     voxel_size: float,
     model: MoGeModel,
@@ -197,17 +198,22 @@ def fuse_cameras_auto(
     refine_steps: int,
     use_fp16: bool,
     resize_to: Optional[int],
+    max_depth: Optional[float] = None,
 ) -> dict:
     """Run MoGe on each photo that has a cameras_auto entry, matched by filename."""
     document: CamerasAuto = load_cameras_auto(cameras_path)
-    views, skipped = match_cameras_to_images(document)
+    depth_max = document.max_depth_m if max_depth is None else float(max_depth)
+    if depth_max <= 0:
+        raise click.BadParameter("max-depth must be positive")
+    views, skipped = match_cameras_to_images(document, image_dir)
     for name in skipped:
         print(f"[posed] skip {name}: no cameras_auto entry for that image, or the image file is missing")
 
+    print(f"[posed] images {image_dir}")
     print(
         f"[posed] cameras_auto {document.world_frame}: {len(views)} views, "
         f"shared metricScale {document.metric_scale:.6f}, "
-        f"max depth {document.max_depth_m:.1f} m"
+        f"max depth {depth_max:.1f} m"
     )
     print("[posed] MoGe predicts depth. JSON intrinsics set FOV, cameraToWorld places points, metricScale scales them.")
 
@@ -247,7 +253,7 @@ def fuse_cameras_auto(
                 f"{view.name}: MoGe depth {depth.shape} != image {rgb.shape[0]}x{rgb.shape[1]}"
             )
         scaled_depth = np.asarray(depth, dtype=np.float64) * float(view.metric_scale)
-        valid = _valid_pixels(points, scaled_depth, mask, depth_max=document.max_depth_m)
+        valid = _valid_pixels(points, scaled_depth, mask, depth_max=depth_max)
         world_raw, _ = _cloud_from_view(points, rgb, valid, view.camera_to_world, 1.0)
         world_scaled, point_colors = _cloud_from_view(
             points, rgb, valid, view.camera_to_world, view.metric_scale
@@ -255,7 +261,7 @@ def fuse_cameras_auto(
         median_depth = median_valid_depth(
             scaled_depth,
             valid,
-            depth_max=document.max_depth_m,
+            depth_max=depth_max,
         )
         print(
             f"[posed] {view.name}: median scaled depth {median_depth:.3f} m, points {len(world_scaled)}"
@@ -307,7 +313,7 @@ def fuse_cameras_auto(
         "world": document.world_frame,
         "camera_axes": document.camera_axes,
         "units": document.units,
-        "max_depth_m": float(document.max_depth_m),
+        "max_depth_m": float(depth_max),
         "metric_scale": float(document.metric_scale),
         "align": "metric_scale",
         "depth": "moge",
@@ -329,7 +335,9 @@ def fuse_cameras_auto(
 
 
 @click.command(help="Fuse posed perspective images into one world point cloud.")
+@click.option("--input", "-i", "input_path", required=True, type=click.Path(exists=True, file_okay=False), help="Folder of the perspective images named in cameras_auto.json.")
 @click.option("--cameras", "cameras_path", required=True, type=click.Path(exists=True, dir_okay=False), help="cameras_auto.json. MoGe predicts depth; JSON supplies K, poses, and metricScale.")
+@click.option("--max-depth", "max_depth", type=float, default=None, help="Drop points farther than this many meters. Default: source.maxDepthMeters from cameras_auto.json.")
 @click.option("--voxel-size", default=0.0, show_default=True, type=float, help="Voxel size in meters for aligned_rgb.ply. 0 keeps every point.")
 @click.option("--output", "-o", "output_path", type=click.Path(), default="./output_posed", show_default=True)
 @click.option("--model", "-m", "model_name", type=click.Choice(["vitl", "vitg", "moge-3-vitl", "moge-3-vitg"]), default="vitl", show_default=True)
@@ -342,7 +350,9 @@ def fuse_cameras_auto(
 @click.option("--num_tokens", type=int, default=None)
 @click.option("--refine_steps", type=int, default=3, show_default=True)
 def main(
+    input_path: str,
     cameras_path: str,
+    max_depth: Optional[float],
     voxel_size: float,
     output_path: str,
     model_name: str,
@@ -385,6 +395,7 @@ def main(
     model = MoGeModel.from_pretrained(pretrained_model_name_or_path).to(device).eval()
     fuse_cameras_auto(
         Path(cameras_path),
+        Path(input_path),
         Path(output_path),
         voxel_size,
         model,
@@ -394,6 +405,7 @@ def main(
         refine_steps,
         use_fp16,
         resize_to,
+        max_depth,
     )
 
 

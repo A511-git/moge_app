@@ -495,14 +495,17 @@ def test_fuse_cameras_auto_scales_moge_depth() -> None:
             document = json.loads(path.read_text(encoding="utf-8"))
             document["cameras"][1]["frameIndex"] = 0
             path.write_text(json.dumps(document), encoding="utf-8")
+            images = folder / "images"
+            images.mkdir()
             image = np.zeros((4, 4, 3), dtype=np.uint8)
             image[..., 0] = 255
-            cv2.imwrite(str(folder / "near.jpg"), image)
-            cv2.imwrite(str(folder / "far.jpg"), image)
-            cv2.imwrite(str(folder / "stray.jpg"), image)
+            cv2.imwrite(str(images / "near.jpg"), image)
+            cv2.imwrite(str(images / "far.jpg"), image)
+            cv2.imwrite(str(images / "stray.jpg"), image)
             out = folder / "out"
             report = fuse_cameras_auto(
                 path,
+                images,
                 out,
                 voxel_size=0.0,
                 model=None,
