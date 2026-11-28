@@ -427,13 +427,14 @@ def test_cameras_auto_loads_without_depth_files() -> None:
             camera.pop("intrinsicsNetwork")
             camera.pop("worldToCamera")
             camera.pop("position")
+        cameras[0]["scene"] = None
         path = _write_cameras_auto(folder, cameras)
         document = load_cameras_auto(path)
 
     assert document.world_frame == "view0World"
     assert document.metric_scale == 5.25
     assert document.max_depth_m == 25.0
-    assert [view.scene for view in document.views] == ["nearScene", "farScene"]
+    assert [view.scene for view in document.views] == [None, "farScene"]
     assert np.allclose(document.views[1].origin, [0.0, 0.0, 3.0])
     assert document.views[0].intrinsics_image.fx == 8.0
     assert abs(document.views[0].intrinsics_image.fov_x_deg - (2.0 * np.degrees(np.arctan(4.0 / 16.0)))) < 1e-9

@@ -120,7 +120,7 @@ class CamerasAutoView:
     """
 
     image_name: str
-    scene: str
+    scene: Optional[str]
     metric_scale: float
     intrinsics_image: CameraIntrinsics
     camera_to_world: np.ndarray
@@ -337,8 +337,9 @@ def _resolve_sibling(root: Path, raw: object, label: str) -> Path:
 def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
     """Ingest ``cameras_auto.json``.
 
-    Geometry used per camera: image name, scene, ``intrinsicsImage``,
+    Geometry used per camera: image name, ``intrinsicsImage``,
     ``cameraToWorld``, and ``metricScale``. ``metricScale`` must be shared.
+    ``scene`` is recorded when present and may be null.
     ``frameIndex``, ``intrinsicsNetwork``, ``worldToCamera``, ``position``,
     and any ``depth`` path are ignored. MoGe predicts depth.
     """
@@ -383,8 +384,8 @@ def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
         scene = camera.get("scene")
         if not isinstance(image_name, str) or not image_name:
             raise ValueError(f"{label} is missing image")
-        if not isinstance(scene, str) or not scene:
-            raise ValueError(f"{label} is missing scene")
+        if scene is not None and not isinstance(scene, str):
+            raise ValueError(f"{label} scene must be a string or null")
 
         metric_scale = _finite_float(camera.get("metricScale"), f"{label}.metricScale")
         if metric_scale <= 0:
