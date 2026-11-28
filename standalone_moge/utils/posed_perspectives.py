@@ -110,6 +110,70 @@ class ScaleResult:
     sufficient_overlap: bool
 
 
+@dataclass
+class CamerasAutoView:
+    """One camera from ``cameras_auto.json``.
+
+    ``metric_scale`` is the shared model output. Poses are already in meters in
+    ``world_frame`` (view-0 world for the auto export), so depth is unprojected
+    with ``s = Z`` and is not multiplied by ``metric_scale`` again.
+    """
+
+    image_name: str
+    scene: str
+    frame_index: int
+    metric_scale: float
+    intrinsics_network: CameraIntrinsics
+    intrinsics_image: CameraIntrinsics
+    position: np.ndarray
+    camera_to_world: np.ndarray
+    world_to_camera: np.ndarray
+    image_path: Path
+    depth_path: Path
+    source_path: Path
+
+    @property
+    def name(self) -> str:
+        return Path(self.image_name).stem
+
+    @property
+    def origin(self) -> np.ndarray:
+        return np.asarray(self.camera_to_world[:3, 3], dtype=np.float64).copy()
+
+    def intrinsics_for_depth(self, depth: np.ndarray) -> Tuple[CameraIntrinsics, str]:
+        """Pick network or photo K by the depth map's width and height."""
+        depth_map = np.asarray(depth)
+        if depth_map.ndim != 2:
+            raise ValueError(f"{self.name}: depth must be HxW, got {depth_map.shape}")
+        height, width = int(depth_map.shape[0]), int(depth_map.shape[1])
+        network = self.intrinsics_network
+        photo = self.intrinsics_image
+        if width == network.width and height == network.height:
+            return network, "network"
+        if width == photo.width and height == photo.height:
+            return photo, "image"
+        raise ValueError(
+            f"{self.name}: depth {width}x{height} matches neither "
+            f"network {network.width}x{network.height} nor "
+            f"image {photo.width}x{photo.height}"
+        )
+
+
+@dataclass
+class CamerasAuto:
+    """Document-level convention plus every camera in ``cameras_auto.json``."""
+
+    world_frame: str
+    camera_axes: str
+    units: str
+    matrix_order: str
+    projection: str
+    max_depth_m: float
+    metric_scale: float
+    views: List[CamerasAutoView]
+    path: Path
+
+
 def fov_x_degrees(width: float, fx: float) -> float:
     """Horizontal FOV in degrees from image width and ``fx``."""
     if fx <= 0 or width <= 0:
@@ -235,6 +299,251 @@ def load_perspective_frame(
         image_path=image,
         poses_path=path,
     )
+
+
+def _finite_float(value: object, label: str) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not a number") from exc
+    if not np.isfinite(number):
+        raise ValueError(f"{label} is not finite")
+    return number
+
+
+def _parse_intrinsics_block(block: object, label: str) -> CameraIntrinsics:
+    """Read ``fx/fy/cx/cy`` and check the nested ``K`` repeats them."""
+    if not isinstance(block, dict):
+        raise ValueError(f"{label} must be an object")
+    try:
+        fx = _finite_float(block["fx"], f"{label}.fx")
+        fy = _finite_float(block["fy"], f"{label}.fy")
+        cx = _finite_float(block["cx"], f"{label}.cx")
+        cy = _finite_float(block["cy"], f"{label}.cy")
+        width = int(block["width"])
+        height = int(block["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is missing fx/fy/cx/cy/width/height") from exc
+    if fx <= 0 or fy <= 0 or width <= 0 or height <= 0:
+        raise ValueError(f"{label} focal and size must be positive")
+    try:
+        matrix = np.asarray(block["K"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label}.K is missing") from exc
+    expected = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.allclose(matrix, expected, rtol=0.0, atol=1e-3):
+        raise ValueError(f"{label}.K does not match fx/fy/cx/cy")
+    return CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy, width=width, height=height)
+
+
+def _size_pair(block: object, label: str) -> Tuple[int, int]:
+    if not isinstance(block, dict):
+        raise ValueError(f"{label} must be an object")
+    try:
+        width = int(block["width"])
+        height = int(block["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is missing width/height") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{label} size must be positive")
+    return width, height
+
+
+def _resolve_sibling(root: Path, raw: object, label: str) -> Path:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{label} must be a path string")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = root / path
+    return path
+
+
+def load_cameras_auto(path: Union[str, Path]) -> CamerasAuto:
+    """Ingest ``cameras_auto.json``.
+
+    Geometry used per camera: image path, scene, frame index, both intrinsics
+    blocks, ``cameraToWorld`` / ``worldToCamera``, and the depth path. ``position``
+    is checked against the pose translation and is not a second pose.
+    ``metricScale`` must be the same on every camera. ``comment`` and
+    ``source.mode`` / ``poseMap`` / ``input`` are not read.
+    """
+    json_path = Path(path)
+    with json_path.open("r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise ValueError(f"{json_path} is not a JSON object")
+
+    convention = document.get("convention")
+    if not isinstance(convention, dict):
+        raise ValueError(f"{json_path} has no convention object")
+    camera_axes = convention.get("cameraAxes")
+    matrix_order = convention.get("matrixOrder")
+    units = convention.get("units")
+    if camera_axes != "opencvRDF":
+        raise ValueError(f"{json_path} cameraAxes must be opencvRDF, got {camera_axes!r}")
+    if matrix_order != "columnMajor":
+        raise ValueError(f"{json_path} matrixOrder must be columnMajor, got {matrix_order!r}")
+    if units != "meters":
+        raise ValueError(f"{json_path} units must be meters, got {units!r}")
+    world_frame = str(convention.get("frame") or "")
+    projection = str(convention.get("projection") or "")
+
+    source = document.get("source")
+    if not isinstance(source, dict) or "maxDepthMeters" not in source:
+        raise ValueError(f"{json_path} is missing source.maxDepthMeters")
+    max_depth_m = _finite_float(source["maxDepthMeters"], f"{json_path} source.maxDepthMeters")
+    if max_depth_m <= 0:
+        raise ValueError(f"{json_path} source.maxDepthMeters must be positive")
+
+    cameras = document.get("cameras")
+    if not isinstance(cameras, list) or len(cameras) == 0:
+        raise ValueError(f"{json_path} has no cameras")
+
+    root = json_path.parent
+    views: List[CamerasAutoView] = []
+    for index, camera in enumerate(cameras):
+        label = f"{json_path} cameras[{index}]"
+        if not isinstance(camera, dict):
+            raise ValueError(f"{label} is not an object")
+        image_name = camera.get("image")
+        scene = camera.get("scene")
+        if not isinstance(image_name, str) or not image_name:
+            raise ValueError(f"{label} is missing image")
+        if not isinstance(scene, str) or not scene:
+            raise ValueError(f"{label} is missing scene")
+        try:
+            frame_index = int(camera["frameIndex"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{label} is missing frameIndex") from exc
+
+        metric_scale = _finite_float(camera.get("metricScale"), f"{label}.metricScale")
+        if metric_scale <= 0:
+            raise ValueError(f"{label}.metricScale must be positive")
+
+        network_size = _size_pair(camera.get("networkImage"), f"{label}.networkImage")
+        photo_size = _size_pair(camera.get("originalImage"), f"{label}.originalImage")
+        intrinsics_network = _parse_intrinsics_block(camera.get("intrinsicsNetwork"), f"{label}.intrinsicsNetwork")
+        intrinsics_image = _parse_intrinsics_block(camera.get("intrinsicsImage"), f"{label}.intrinsicsImage")
+        if (intrinsics_network.width, intrinsics_network.height) != network_size:
+            raise ValueError(f"{label} intrinsicsNetwork size != networkImage")
+        if (intrinsics_image.width, intrinsics_image.height) != photo_size:
+            raise ValueError(f"{label} intrinsicsImage size != originalImage")
+
+        try:
+            camera_to_world = matrix_from_column_major(camera["cameraToWorld"])
+            world_to_camera = matrix_from_column_major(camera["worldToCamera"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{label} is missing a 4x4 pose") from exc
+        inverse_error = np.linalg.norm(camera_to_world @ world_to_camera - np.eye(4))
+        if inverse_error > 1e-3:
+            raise ValueError(
+                f"{label} cameraToWorld and worldToCamera disagree (error {inverse_error:.3e})"
+            )
+
+        position_json = camera.get("position")
+        if not isinstance(position_json, dict):
+            raise ValueError(f"{label} is missing position")
+        try:
+            position = np.array(
+                [
+                    _finite_float(position_json["x"], f"{label}.position.x"),
+                    _finite_float(position_json["y"], f"{label}.position.y"),
+                    _finite_float(position_json["z"], f"{label}.position.z"),
+                ],
+                dtype=np.float64,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{label}.position must have x/y/z") from exc
+        origin = camera_to_world[:3, 3]
+        if not np.allclose(position, origin, rtol=0.0, atol=1e-4):
+            raise ValueError(f"{label}.position does not match cameraToWorld translation")
+
+        views.append(
+            CamerasAutoView(
+                image_name=image_name,
+                scene=scene,
+                frame_index=frame_index,
+                metric_scale=metric_scale,
+                intrinsics_network=intrinsics_network,
+                intrinsics_image=intrinsics_image,
+                position=position,
+                camera_to_world=camera_to_world,
+                world_to_camera=world_to_camera,
+                image_path=_resolve_sibling(root, image_name, f"{label}.image"),
+                depth_path=_resolve_sibling(root, camera.get("depth"), f"{label}.depth"),
+                source_path=json_path,
+            )
+        )
+
+    scales = np.asarray([view.metric_scale for view in views], dtype=np.float64)
+    if not np.allclose(scales, scales[0], rtol=1e-5, atol=1e-6):
+        raise ValueError(f"{json_path} metricScale is not shared across cameras: {scales.tolist()}")
+
+    return CamerasAuto(
+        world_frame=world_frame,
+        camera_axes=str(camera_axes),
+        units=str(units),
+        matrix_order=str(matrix_order),
+        projection=projection,
+        max_depth_m=max_depth_m,
+        metric_scale=float(scales[0]),
+        views=views,
+        path=json_path,
+    )
+
+
+def depth_valid_mask(
+    depth: np.ndarray,
+    depth_min: float = DEPTH_MIN_M,
+    depth_max: float = DEPTH_MAX_M,
+) -> np.ndarray:
+    """Finite depths inside ``[depth_min, depth_max]``."""
+    depth_map = np.asarray(depth, dtype=np.float64)
+    if depth_map.ndim != 2:
+        raise ValueError(f"depth must be HxW, got {depth_map.shape}")
+    return np.isfinite(depth_map) & (depth_map >= depth_min) & (depth_map <= depth_max)
+
+
+def place_auto_view(
+    view: CamerasAutoView,
+    depth: np.ndarray,
+    colors: np.ndarray,
+    depth_max: float,
+    depth_min: float = DEPTH_MIN_M,
+) -> Tuple[np.ndarray, np.ndarray, CameraIntrinsics, str, float]:
+    """Unproject one ingested depth map with ``s = Z`` and its ``cameraToWorld``.
+
+    ``metric_scale`` is not applied. The depth values are already the Z the
+    JSON projection equation uses, in the same meters as the pose.
+    """
+    depth_map = np.asarray(depth, dtype=np.float64)
+    intrinsics, which = view.intrinsics_for_depth(depth_map)
+    color_map = np.asarray(colors)
+    if color_map.ndim != 3 or color_map.shape[2] != 3:
+        raise ValueError(f"{view.name}: colors must be HxWx3, got {color_map.shape}")
+    if color_map.shape[:2] != depth_map.shape[:2]:
+        raise ValueError(
+            f"{view.name}: colors {color_map.shape[:2]} != depth {depth_map.shape[:2]}"
+        )
+    valid = depth_valid_mask(depth_map, depth_min=depth_min, depth_max=depth_max)
+    median_depth = median_valid_depth(depth_map, valid, depth_min=depth_min, depth_max=depth_max)
+    if not np.any(valid):
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.uint8),
+            intrinsics,
+            which,
+            median_depth,
+        )
+    rows, cols = np.nonzero(valid)
+    points = unproject_pixels(
+        cols.astype(np.float64),
+        rows.astype(np.float64),
+        depth_map[valid],
+        intrinsics,
+        view.camera_to_world,
+    )
+    return points, np.asarray(color_map[valid], dtype=np.uint8), intrinsics, which, median_depth
 
 
 def camera_points_to_world(points_cam: np.ndarray, camera_to_world: np.ndarray) -> np.ndarray:

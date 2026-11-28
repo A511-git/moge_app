@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Fuse posed perspective photos in one ARKit world, with overlap scale alignment.
+"""Fuse posed perspective photos into one world point cloud.
 
-Each image is run through MoGe at the horizontal FOV implied by its JSON
-intrinsics. Camera-space points are scaled about that camera, then placed with
-the frame's column-major ``cameraToWorld`` (OpenCV RDF to ARKit world).
+Two inputs:
+
+* ``--input`` / ``--image`` + ``--poses``: ARKit pose JSON. MoGe runs at the
+  horizontal FOV implied by those intrinsics, then an overlap scale is solved.
+* ``--cameras``: ``cameras_auto.json``. Depth, model K, view-0 poses, and the
+  shared ``metricScale`` are ingested. Points are unprojected with ``s = Z``
+  and placed with ``cameraToWorld``. No second per-view scale is solved.
 
 This is not the panorama path: cameras are translated, and ``merge_panorama_depth``
 is not used.
@@ -33,13 +37,16 @@ try:
     from standalone_moge.utils.posed_perspectives import (
         DEPTH_MAX_M,
         DEPTH_MIN_M,
+        CamerasAuto,
         PerspectiveFrame,
         ScaleResult,
         choose_reference_index,
         discover_perspective_pairs,
         estimate_scale,
+        load_cameras_auto,
         load_perspective_frame,
         median_valid_depth,
+        place_auto_view,
     )
 except ImportError:
     from .model import MoGeModel
@@ -48,13 +55,16 @@ except ImportError:
     from .utils.posed_perspectives import (
         DEPTH_MAX_M,
         DEPTH_MIN_M,
+        CamerasAuto,
         PerspectiveFrame,
         ScaleResult,
         choose_reference_index,
         discover_perspective_pairs,
         estimate_scale,
+        load_cameras_auto,
         load_perspective_frame,
         median_valid_depth,
+        place_auto_view,
     )
 
 
@@ -202,8 +212,175 @@ def _view_record(
     return record
 
 
-@click.command(help="Fuse posed perspective images into one ARKit-world point cloud.")
+def _load_depth_map(path: Path) -> np.ndarray:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Depth map not found: {path}. cameras_auto.json points at this file "
+            "(usually depths/<image>_depth.npy next to the JSON)."
+        )
+    depth = np.load(path)
+    depth = np.asarray(depth)
+    if depth.ndim == 3 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+    elif depth.ndim == 3 and depth.shape[0] == 1:
+        depth = depth[0]
+    if depth.ndim != 2:
+        raise ValueError(f"{path} depth must be HxW, got {tuple(depth.shape)}")
+    return np.asarray(depth, dtype=np.float64)
+
+
+def _colors_for_depth(image_path: Path, height: int, width: int) -> np.ndarray:
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(f"Unreadable image: {image_path}")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    if rgb.shape[0] != height or rgb.shape[1] != width:
+        rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
+    return rgb
+
+
+def _write_clouds(
+    out_dir: Path,
+    tint_points: List[np.ndarray],
+    tint_colors: List[np.ndarray],
+    rgb_points: List[np.ndarray],
+    rgb_colors: List[np.ndarray],
+    voxel_size: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    def _concat(chunks: List[np.ndarray], width: int, dtype) -> np.ndarray:
+        if not chunks:
+            return np.zeros((0, width), dtype=dtype)
+        return np.concatenate(chunks, axis=0)
+
+    write_rgb_ply(
+        out_dir / "unaligned_by_source.ply",
+        _concat(tint_points, 3, np.float32),
+        _concat(tint_colors, 3, np.uint8),
+    )
+    write_rgb_ply(
+        out_dir / "aligned_by_source.ply",
+        _concat(tint_points, 3, np.float32),
+        _concat(tint_colors, 3, np.uint8),
+    )
+    rgb_pts = _concat(rgb_points, 3, np.float32)
+    rgb_cols = _concat(rgb_colors, 3, np.uint8)
+    if voxel_size > 0.0:
+        rgb_pts, rgb_cols = voxel_downsample_points(rgb_pts, rgb_cols, voxel_size)
+    write_rgb_ply(out_dir / "aligned_rgb.ply", rgb_pts, rgb_cols)
+    return rgb_pts, rgb_cols
+
+
+def fuse_cameras_auto(
+    cameras_path: Path,
+    output_path: Path,
+    frame_index: int,
+    voxel_size: float,
+) -> dict:
+    """Place every ingested camera. Depth is Z in meters; metricScale is not reapplied."""
+    document: CamerasAuto = load_cameras_auto(cameras_path)
+    views = [view for view in document.views if view.frame_index == int(frame_index)]
+    if not views:
+        found = sorted({view.frame_index for view in document.views})
+        raise click.UsageError(
+            f"No cameras with frameIndex {frame_index} in {cameras_path}. Found {found}."
+        )
+
+    print(
+        f"[posed] cameras_auto {document.world_frame}: {len(views)} views, "
+        f"shared metricScale {document.metric_scale:.6f}, "
+        f"max depth {document.max_depth_m:.1f} m"
+    )
+    print("[posed] Depth unprojected with s=Z. metricScale is not applied a second time.")
+
+    tint_points: List[np.ndarray] = []
+    tint_colors: List[np.ndarray] = []
+    rgb_points: List[np.ndarray] = []
+    rgb_colors: List[np.ndarray] = []
+    view_records = []
+
+    for index, view in enumerate(views):
+        depth = _load_depth_map(view.depth_path)
+        colors = _colors_for_depth(view.image_path, depth.shape[0], depth.shape[1])
+        points, point_colors, intrinsics, which, median_depth = place_auto_view(
+            view,
+            depth,
+            colors,
+            depth_max=document.max_depth_m,
+        )
+        print(
+            f"[posed] {view.name}: K={which} {intrinsics.width}x{intrinsics.height}, "
+            f"fov_x={intrinsics.fov_x_deg:.2f} deg, "
+            f"origin={np.round(view.origin, 3).tolist()}, "
+            f"median depth {median_depth:.3f} m, points {len(points)}"
+        )
+        if len(points):
+            tint_points.append(points.astype(np.float32))
+            tint_colors.append(_tint(len(points), index))
+            rgb_points.append(points.astype(np.float32))
+            rgb_colors.append(point_colors)
+
+        view_records.append(
+            {
+                "name": view.name,
+                "scene": view.scene,
+                "image": str(view.image_path),
+                "depth": str(view.depth_path),
+                "frame_index": int(view.frame_index),
+                "intrinsics": which,
+                "fov_x_deg": float(intrinsics.fov_x_deg),
+                "fov_y_deg": float(intrinsics.fov_y_deg),
+                "fx": float(intrinsics.fx),
+                "fy": float(intrinsics.fy),
+                "cx": float(intrinsics.cx),
+                "cy": float(intrinsics.cy),
+                "width": int(intrinsics.width),
+                "height": int(intrinsics.height),
+                "origin": [float(v) for v in view.origin],
+                "position": [float(v) for v in view.position],
+                "metric_scale": float(view.metric_scale),
+                "median_depth_m": _json_float(median_depth),
+                "scale": 1.0,
+            }
+        )
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    rgb_pts, _rgb_cols = _write_clouds(
+        output_path, tint_points, tint_colors, rgb_points, rgb_colors, voxel_size
+    )
+
+    report = {
+        "source": "cameras_auto",
+        "cameras": str(document.path),
+        "world": document.world_frame,
+        "camera_axes": document.camera_axes,
+        "units": document.units,
+        "projection": document.projection,
+        "max_depth_m": float(document.max_depth_m),
+        "metric_scale": float(document.metric_scale),
+        "align": "shared_metric_scale",
+        "frame_index": int(frame_index),
+        "views": view_records,
+    }
+    if len(views) == 2:
+        report["baseline_m"] = float(np.linalg.norm(views[0].origin - views[1].origin))
+
+    ingest_path = output_path / "ingest.json"
+    with ingest_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+
+    print(f"[posed] Wrote {output_path / 'unaligned_by_source.ply'}")
+    print(f"[posed] Wrote {output_path / 'aligned_by_source.ply'}")
+    print(f"[posed] Wrote {output_path / 'aligned_rgb.ply'} ({len(rgb_pts)} points)")
+    print(f"[posed] Wrote {ingest_path}")
+    return report
+
+
+@click.command(help="Fuse posed perspective images into one world point cloud.")
 @click.option("--input", "-i", "input_path", type=click.Path(exists=True, file_okay=False), default=None, help="Folder of images plus *_poses_world_opencv_rdf.json.")
+@click.option("--cameras", "cameras_path", type=click.Path(exists=True, dir_okay=False), default=None, help="cameras_auto.json. Uses its depth, K, view-0 poses, and shared metricScale.")
 @click.option("--image", "images", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Perspective image. Repeat, paired in order with --poses.")
 @click.option("--poses", "poses", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Pose JSON for the matching --image.")
 @click.option("--frame-index", default=11, show_default=True, type=int, help="Frame index inside each pose JSON.")
@@ -223,6 +400,7 @@ def _view_record(
 @click.option("--refine_steps", type=int, default=3, show_default=True)
 def main(
     input_path: Optional[str],
+    cameras_path: Optional[str],
     images: Tuple[str, ...],
     poses: Tuple[str, ...],
     frame_index: int,
@@ -247,6 +425,12 @@ def main(
         raise click.BadParameter("stride must be >= 1")
     if voxel_size < 0:
         raise click.BadParameter("voxel-size must be >= 0")
+
+    if cameras_path is not None:
+        if input_path or images or poses:
+            raise click.UsageError("Pass --cameras alone, not with --input or --image/--poses.")
+        fuse_cameras_auto(Path(cameras_path), Path(output_path), frame_index, voxel_size)
+        return
 
     pairs = _resolve_inputs(input_path, images, poses)
     if device_name.startswith("cuda") and torch.cuda.is_available():
